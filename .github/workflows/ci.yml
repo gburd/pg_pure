@@ -53,6 +53,9 @@ jobs:
 
       - name: Install the LLVM/Pure build deps
         run: |
+          # Ubuntu runners ship an older LLVM; libpure needs >= 20.1. Pull the
+          # requested major from apt.llvm.org via the official installer.
+          curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- ${LLVM_MAJOR}
           sudo apt-get install -y --no-install-recommends \
             llvm-${LLVM_MAJOR}-dev clang-${LLVM_MAJOR} \
             libgmp-dev libmpfr-dev libreadline-dev \
