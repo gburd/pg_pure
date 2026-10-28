@@ -138,7 +138,7 @@ jobs:
             2*|3*)
               echo "PGXN upload accepted." ;;
             409)
-              if grep -qiE 'already (been )?(released|uploaded)|same version|conflicts with' /tmp/pgxn_resp.txt; then
+              if grep -qiE 'already exists|already (been )?(released|uploaded)|same version|conflicts with' /tmp/pgxn_resp.txt; then
                 echo "::warning::this version is already published; skipping."
               else
                 echo "::error::PGXN rejected the upload (HTTP 409). Reason above (often an invalid META.json)."; exit 1
