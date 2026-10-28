@@ -1,0 +1,8 @@
+# pg_pure extension (trusted PL/Pure)
+comment = 'PL/Pure trusted procedural language (functions written in Pure)'
+default_version = '0.1'
+module_pathname = '$libdir/pg_pure'
+relocatable = false
+superuser = false
+trusted = true
+requires = ''

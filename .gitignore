@@ -1,0 +1,24 @@
+# build output
+*.o
+*.so
+*.bc
+/results/
+/log/
+/tmp_check/
+regression.diffs
+regression.out
+
+# regression expected output is TRACKED (a global ~/.config/git/ignore drops
+# *.out; force it back in so a clone has the expected files).
+!expected/*.out
+
+# agent tooling and local scratch (not part of the extension)
+.claude/
+.kiro/
+.direnv/
+.pi/
+.memelord/
+.mcp.json
+.envrc
+.agent-steering-domains.md
+/_/

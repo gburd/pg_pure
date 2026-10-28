@@ -1,0 +1,131 @@
+name: CI
+
+# Build pg_pure against the fork's libpure and run the regression suite on
+# PostgreSQL 17, 18 and 19.
+#
+# libpure is not packaged, so CI builds it from the fork
+# (github.com/gburd/pure-lang, branch libpure-embeddable) and caches the
+# install by the branch commit. The expensive part is the one-time libpure
+# build, not pg_pure.
+#
+# The server is installed WITHOUT its LLVM JIT package (postgresql-NN-jit). A
+# PostgreSQL that never loads LLVM cannot clash with libpure's LLVM, which is
+# the supported 0.1 deployment (README "The LLVM coexistence rule"). jit=on is
+# then a silent no-op.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  LLVM_MAJOR: "21"
+  PURE_REF: libpure-embeddable
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["17", "18", "19"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add PGDG apt repo
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          CODENAME=$(lsb_release -cs)
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          # PG 19 is unreleased; it lives in the -pgdg-snapshot repo.
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg-snapshot main 19" \
+            | sudo tee /etc/apt/sources.list.d/pgdg-snapshot.list >/dev/null
+          sudo apt-get update
+
+      - name: Install the LLVM/Pure build deps
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            llvm-${LLVM_MAJOR}-dev clang-${LLVM_MAJOR} \
+            libgmp-dev libmpfr-dev libreadline-dev \
+            autoconf automake libtool bison flex pkg-config gcc make zip
+
+      # Cache the libpure install by its branch commit, so the ~2-minute build
+      # runs only when the fork advances.
+      - name: Resolve libpure commit
+        id: pure
+        run: |
+          SHA=$(git ls-remote https://github.com/gburd/pure-lang.git "refs/heads/${PURE_REF}" | cut -f1)
+          echo "sha=$SHA" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libpure
+        id: purecache
+        uses: actions/cache@v4
+        with:
+          path: ~/pure
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}
+
+      - name: Build libpure from the fork
+        if: steps.purecache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "${PURE_REF}" https://github.com/gburd/pure-lang.git
+          cd pure-lang/pure
+          autoreconf -fi
+          ./configure --prefix="$HOME/pure" \
+            --with-tool-prefix="/usr/lib/llvm-${LLVM_MAJOR}/bin" --enable-release \
+            LLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config" \
+            CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}"
+          make -j"$(nproc)"
+          make install
+
+      - name: Install PostgreSQL ${{ matrix.pg }} WITHOUT the JIT package
+        run: |
+          if [ "${{ matrix.pg }}" = "19" ]; then
+            sudo apt-get install -y --no-install-recommends -t "$(lsb_release -cs)-pgdg-snapshot" \
+              postgresql-19 postgresql-server-dev-19 libpq-dev libpq5
+          else
+            sudo apt-get install -y --no-install-recommends \
+              postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
+          fi
+          # Ensure no llvmjit is present (a clean image has none, but be explicit).
+          sudo apt-get remove -y postgresql-${{ matrix.pg }}-jit 2>/dev/null || true
+
+      - name: Build and install pg_pure
+        run: |
+          PGBIN=/usr/lib/postgresql/${{ matrix.pg }}/bin
+          make PG_CONFIG=$PGBIN/pg_config PURE_PREFIX="$HOME/pure"
+          make check-ascii
+          sudo make install PG_CONFIG=$PGBIN/pg_config PURE_PREFIX="$HOME/pure"
+
+      - name: Regression suite (and crash check)
+        run: |
+          PGBIN=/usr/lib/postgresql/${{ matrix.pg }}/bin
+          D="$RUNNER_TEMP/pgdata"
+          $PGBIN/initdb -A trust -U postgres -D "$D"
+          {
+            echo "listen_addresses=''"
+            echo "unix_socket_directories='/tmp'"
+            echo "port=5999"
+            echo "jit=on"
+          } >> "$D/postgresql.conf"
+          PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
+          set +e
+          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres
+          rc=$?
+          set -e
+          $PGBIN/pg_ctl -D "$D" -m fast stop || true
+          if grep -q "terminated by signal" "$D/log"; then
+            echo "::error::a backend crashed during the suite"; grep "terminated by signal" "$D/log"; exit 1
+          fi
+          if [ $rc -ne 0 ]; then
+            echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true
+            exit $rc
+          fi

@@ -1,0 +1,143 @@
+name: Release
+
+# Tag-triggered release: a vX.Y.Z tag builds + tests, attaches the PGXN source
+# zip to a GitHub Release, publishes to PGXN, and drafts/queues the
+# postgresql.org news announcement.
+#
+# PGXN rejects duplicate versions, so re-running a published tag reports 409 and
+# moves on. The announce step is a no-op unless PGORG_* secrets are set.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to (re)publish, e.g. v0.1.0'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  LLVM_MAJOR: "21"
+  PURE_REF: libpure-embeddable
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Resolve release version
+        id: ver
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=${TAG#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify checkout matches the tag
+        run: |
+          WANT="${{ steps.ver.outputs.version }}"
+          GOT=$(grep -m1 '"version"' META.json | sed -E 's/.*"version": *"([^"]+)".*/\1/')
+          if [ "$GOT" != "$WANT" ]; then
+            echo "::error::META.json version $GOT does not match tag ${{ steps.ver.outputs.tag }}"; exit 1
+          fi
+
+      - name: Add PGDG apt repo
+        run: |
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
+          sudo install -d /usr/share/postgresql-common/pgdg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
+          sudo apt-get update
+
+      - name: Install deps
+        run: |
+          sudo apt-get install -y --no-install-recommends \
+            llvm-${LLVM_MAJOR}-dev clang-${LLVM_MAJOR} \
+            libgmp-dev libmpfr-dev libreadline-dev \
+            autoconf automake libtool bison flex pkg-config gcc make zip \
+            postgresql-18 postgresql-server-dev-18
+          sudo apt-get remove -y postgresql-18-jit 2>/dev/null || true
+
+      - name: Resolve libpure commit
+        id: pure
+        run: echo "sha=$(git ls-remote https://github.com/gburd/pure-lang.git refs/heads/${PURE_REF} | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache libpure
+        id: purecache
+        uses: actions/cache@v4
+        with:
+          path: ~/pure
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}
+
+      - name: Build libpure from the fork
+        if: steps.purecache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "${PURE_REF}" https://github.com/gburd/pure-lang.git
+          cd pure-lang/pure && autoreconf -fi
+          ./configure --prefix="$HOME/pure" --with-tool-prefix="/usr/lib/llvm-${LLVM_MAJOR}/bin" \
+            --enable-release LLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config" \
+            CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}"
+          make -j"$(nproc)" && make install
+
+      - name: Build + test (gate the release)
+        run: |
+          PGBIN=/usr/lib/postgresql/18/bin
+          make PG_CONFIG=$PGBIN/pg_config PURE_PREFIX="$HOME/pure"
+          make check-ascii
+          sudo make install PG_CONFIG=$PGBIN/pg_config PURE_PREFIX="$HOME/pure"
+          D="$RUNNER_TEMP/pgdata"; $PGBIN/initdb -A trust -U postgres -D "$D"
+          printf "listen_addresses=''\nunix_socket_directories='/tmp'\nport=5999\n" >> "$D/postgresql.conf"
+          PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
+          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres
+          $PGBIN/pg_ctl -D "$D" -m fast stop
+
+      - name: Build source distribution (PGXN zip)
+        id: dist
+        run: |
+          make dist
+          echo "zip=pg_pure-${{ steps.ver.outputs.version }}.zip" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.ver.outputs.tag }}
+          generate_release_notes: true
+          files: ${{ steps.dist.outputs.zip }}
+
+      - name: Publish to PGXN
+        env:
+          PGXN_USERNAME: ${{ secrets.PGXN_USER }}
+          PGXN_PASSWORD: ${{ secrets.PGXN_PASSWORD }}
+        run: |
+          if [ -z "$PGXN_USERNAME" ] || [ -z "$PGXN_PASSWORD" ]; then
+            echo "::warning::PGXN_USER/PGXN_PASSWORD not set; skipping PGXN upload."; exit 0
+          fi
+          code=$(curl -sS -o /tmp/pgxn_resp.txt -w '%{http_code}' \
+            --user "$PGXN_USERNAME:$PGXN_PASSWORD" \
+            -F "archive=@${{ steps.dist.outputs.zip }};type=application/zip" \
+            https://manager.pgxn.org/upload)
+          echo "PGXN upload HTTP $code"; cat /tmp/pgxn_resp.txt || true
+          case "$code" in
+            2*|3*) echo "PGXN upload accepted." ;;
+            409)   echo "::warning::this version is already published; skipping." ;;
+            *)     echo "::error::PGXN upload failed (HTTP $code)"; exit 1 ;;
+          esac
+
+      - name: Announce to PostgreSQL news/announce
+        env:
+          PGORG_USER: ${{ secrets.PGORG_USER }}
+          PGORG_PASSWORD: ${{ secrets.PGORG_PASSWORD }}
+          PGORG_ORG_ID: ${{ secrets.PGORG_ORG_ID }}
+          PGORG_EMAIL_ID: ${{ secrets.PGORG_EMAIL_ID }}
+          PGORG_TAGS: ${{ secrets.PGORG_TAGS }}
+        run: bash ci/announce.sh "${{ steps.ver.outputs.version }}"

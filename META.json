@@ -1,0 +1,56 @@
+{
+   "name": "pg_pure",
+   "abstract": "Write PostgreSQL functions in the Pure programming language",
+   "description": "pg_pure embeds libpure to make Pure a procedural language in PostgreSQL, like PL/Perl or PL/Python. A function body is Pure code: term rewriting with pattern matching, exact rational and arbitrary-precision arithmetic, lazy streams, and symbolic computation, with database access through SPI. It provides a trusted language (pg_pure, pending a libpure sandbox) and an untrusted, superuser-only language (pg_pureu).",
+   "version": "0.1.0",
+   "maintainer": [
+      "Gregory Burd <greg@burd.me>"
+   ],
+   "license": "postgresql",
+   "provides": {
+      "pg_pure": {
+         "abstract": "Trusted PL/Pure procedural language",
+         "file": "pg_pure--0.1.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      },
+      "pg_pureu": {
+         "abstract": "Untrusted (superuser-only) PL/Pure procedural language",
+         "file": "pg_pureu--0.1.sql",
+         "docfile": "README.md",
+         "version": "0.1.0"
+      }
+   },
+   "prereqs": {
+      "runtime": {
+         "requires": {
+            "PostgreSQL": "17.0.0"
+         }
+      }
+   },
+   "resources": {
+      "repository": {
+         "url": "https://github.com/gburd/pg_pure.git",
+         "web": "https://github.com/gburd/pg_pure",
+         "type": "git"
+      },
+      "bugtracker": {
+         "web": "https://github.com/gburd/pg_pure/issues"
+      },
+      "homepage": "https://github.com/gburd/pg_pure"
+   },
+   "generated_by": "Gregory Burd",
+   "meta-spec": {
+      "version": "1.0.0",
+      "url": "https://pgxn.org/meta/spec.txt"
+   },
+   "tags": [
+      "pure",
+      "procedural language",
+      "pl/pure",
+      "term rewriting",
+      "symbolic computation",
+      "functional",
+      "libpure"
+   ]
+}
