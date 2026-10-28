@@ -4,7 +4,19 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
-## [Unreleased]
+## [0.1.1] - 2026-10-28
+
+### Fixed
+- META.json carried an invalid PGXN tag (`pl/pure`; `/` is not allowed by the
+  PGXN Meta Spec), which PGXN rejected, so **0.1.0 never published to PGXN**.
+  The tag is now `plpure`. The extension code is identical to the 0.1.0 tree;
+  this is a metadata-only fix so the distribution can be released.
+- The release workflow treated a PGXN `409` as "already published" and skipped,
+  which masked the rejected 0.1.0 upload as a success. It now distinguishes an
+  already-published 409 from a real rejection by the response body, and
+  verifies the release is indexed on api.pgxn.org before reporting success.
+
+## [0.1.0] - 2026-10-28 (not published to PGXN)
 
 ### Added
 - Initial extension. One shared library (`pg_pure.so`) backs two SQL

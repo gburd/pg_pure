@@ -129,11 +129,34 @@ jobs:
             -F "archive=@${{ steps.dist.outputs.zip }};type=application/zip" \
             https://manager.pgxn.org/upload)
           echo "PGXN upload HTTP $code"; cat /tmp/pgxn_resp.txt || true
+          # A successful upload is 303 (redirect to the release page). PGXN also
+          # returns 409 for BOTH "this version already exists" AND a rejected
+          # upload (e.g. an invalid META.json) -- the two differ only in the
+          # body, so a bare "409 = skip" hides real rejections (it once masked an
+          # invalid tag and reported a non-existent publish as success).
           case "$code" in
-            2*|3*) echo "PGXN upload accepted." ;;
-            409)   echo "::warning::this version is already published; skipping." ;;
-            *)     echo "::error::PGXN upload failed (HTTP $code)"; exit 1 ;;
+            2*|3*)
+              echo "PGXN upload accepted." ;;
+            409)
+              if grep -qiE 'already (been )?(released|uploaded)|same version|conflicts with' /tmp/pgxn_resp.txt; then
+                echo "::warning::this version is already published; skipping."
+              else
+                echo "::error::PGXN rejected the upload (HTTP 409). Reason above (often an invalid META.json)."; exit 1
+              fi ;;
+            *)
+              echo "::error::PGXN upload failed (HTTP $code)"; exit 1 ;;
           esac
+
+          # Confirm the release is actually indexed; a green step is not a
+          # publish. api.pgxn.org lags the upload by minutes, so poll briefly.
+          VER="${{ steps.ver.outputs.version }}"
+          for i in $(seq 1 12); do
+            if curl -fsS -o /dev/null "https://api.pgxn.org/dist/pg_pure/$VER/META.json"; then
+              echo "verified: pg_pure $VER is live on PGXN."; exit 0
+            fi
+            sleep 20
+          done
+          echo "::warning::pg_pure $VER not yet visible on api.pgxn.org after 4 min (indexing can lag; verify by hand)."
 
       - name: Announce to PostgreSQL news/announce
         env:
