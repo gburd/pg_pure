@@ -33,28 +33,26 @@ a trusted and an untrusted variant from one shared library:
 
 | Extension | Trust | Who can use it | Status |
 |---|---|---|---|
-| `pg_pure`  | trusted   | any user | **stub for now**: the handler refuses to run until libpure has a sandbox (see below) |
-| `pg_pureu` | untrusted | superuser only | works today |
+| `pg_pure`  | trusted   | any user | works; runs in a libpure sandbox |
+| `pg_pureu` | untrusted | superuser only | works |
 
-A Pure program can call any C function through an `extern` declaration, so
-untrusted Pure is as powerful as a C extension and only a superuser may create
-`pg_pureu` functions. The trusted `pg_pure` needs a sandboxed libpure that
-refuses `extern`, inline C, `eval`, and arbitrary `using`; that sandbox does
-not exist yet, so `pg_pure` functions currently raise:
-
-```
-ERROR:  pg_pure (trusted) is not available in this version
-HINT:   Use pg_pureu as a superuser, or wait for the sandboxed pg_pure.
-```
-
-The `pg_pure` extension is installable now so its catalog entry and grants are
-in place; when the sandbox lands, the same functions start working with no
-migration. See `DESIGN.md` §9.
+A Pure program can normally call any C function through an `extern`
+declaration, so untrusted Pure is as powerful as a C extension; only a
+superuser may create `pg_pureu` functions. The trusted `pg_pure` runs each
+function in a libpure **safe-mode** interpreter: a body that tries `extern`,
+inline C, `eval`/`evalcmd`, a native or non-allowlisted `using`, or a
+dangerous prelude function (`exit`, `malloc`, raw pointers) is refused as an
+SQL ERROR, and the backend is unharmed. So an unprivileged user can write
+`pg_pure` functions safely, the way PL/Perl's `plperl` is safe. See
+`DESIGN.md` §9 for exactly what the sandbox blocks and what is still to come
+(per-SQL-user interpreters, a curated prelude, a security review before
+multi-tenant reliance).
 
 ## Examples
 
-All of these run under `pg_pureu`. Every snippet here is exercised by the
-regression suite or was run on the build host.
+All of these run under either language; `pg_pure` (trusted) is usable by any
+user. Every snippet here is exercised by the regression suite or was run on
+the build host.
 
 Arbitrary-precision arithmetic, because Pure integers promote to bigints:
 
@@ -132,25 +130,16 @@ make install          # installs libpure.so + headers + the prelude under $HOME/
 libpure needs LLVM (20.1+; tested with 21) and GMP/MPFR/readline. On Debian:
 `apt install llvm-21-dev clang-21 libgmp-dev libmpfr-dev libreadline-dev`.
 
-### The LLVM coexistence rule (read this before enabling JIT)
+### PostgreSQL JIT coexistence
 
 libpure JIT-compiles Pure with LLVM, and so does PostgreSQL's own JIT
-(`llvmjit`). If the two link **different** LLVM major versions and both end up
-in one backend, the backend crashes at exit (one backend crash restarts every
-session). Three deployments avoid it:
-
-1. **A PostgreSQL built without LLVM.** On Debian, `llvmjit` is the separate
-   package `postgresql-NN-jit`; without it installed, no backend loads LLVM and
-   `jit = on` is a silent no-op. pg_pure then works with any libpure build.
-   **This is the supported path for 0.1** and is what CI tests.
-2. **A PostgreSQL whose `llvmjit` matches libpure's LLVM major.** One copy, no
-   clash.
-3. **A libpure built so it exports no LLVM symbols** (link with `-Bsymbolic`
-   and a version script). This lets a stock PGDG server (LLVM 19) and an
-   LLVM-21 libpure coexist. It is a libpure change tracked as a fork PR; until
-   it lands, use deployment 1 or 2 on a JIT-enabled server.
-
-`DESIGN.md` §5 and §5a have the evidence and the crash backtrace.
+(`llvmjit`), often a different LLVM major. The fork's libpure hides its LLVM
+symbols so the two cannot clash, so **nothing special is required**: pg_pure
+runs on a normal `jit = on` server. (This is tested in CI with
+`jit_above_cost = 0`, which forces a JIT-compiled query into the same backend
+as a Pure function, on PostgreSQL 17/18/19 with zero crashes.) `DESIGN.md` §5
+has the history and the one guard the test suite keeps against a future
+libpure that regresses it.
 
 ## Build and install pg_pure
 
@@ -257,14 +246,16 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.1, in development. Working: scalar functions over int2/int4/int8/float4/
-float8/numeric/bool/text, exact numeric, NULL as `sql::null`, `sql::query`/
-`sql::exec`/`sql::notice`/`sql::warning`, SQL-error-as-`sql::error`, DO blocks,
-the validator, preload warm-up, and `pg_pure` as an installable stub. All of PG
-17/18/19 pass the regression suite with zero crashes.
+0.2, in development. Working: both languages (`pg_pure` trusted via libpure
+safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
+float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
+`sql::query`/`sql::exec`/`sql::notice`/`sql::warning`, SQL-error-as-
+`sql::error`, DO blocks, the validator, and preload warm-up. PostgreSQL
+17/18/19 pass both regression suites with `jit=on` and zero crashes.
 
 Not yet: parameterized SPI, set-returning functions, triggers, arrays and
-composites, the trusted sandbox, and the TAP suite. See `ROADMAP.md`.
+composites, per-SQL-user trusted interpreters, a curated safe-mode prelude,
+and the TAP suite. See `ROADMAP.md`.
 
 ## Documentation
 

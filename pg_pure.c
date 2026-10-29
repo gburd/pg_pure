@@ -3,15 +3,18 @@
  *		A PostgreSQL procedural language whose functions are written in
  *		Pure (https://agraef.github.io/pure-lang/), embedding libpure.
  *
- * The module backs two SQL languages that differ only in trust:
+ * The module backs two SQL languages that differ only in trust, each with its
+ * own backend-local interpreter:
  *
- *	 pg_pure			 trusted; any user may create functions. The curated
- *					 prelude and safe-mode interpreter are not built yet, so
- *					 at this stage the trusted handler refuses to run (see
- *					 pg_pure_trusted_unsupported). It exists so the extension
- *					 and its grants are in place; DESIGN.md section 9.
- *	 pg_pureu	 untrusted; superuser only. Pure code may call any C
- *					 function through extern, so this is the plperlu analogue.
+ *	 pg_pure			 trusted; any user may create functions. Its interpreter is
+ *					 created with libpure's --safe mode and armed after the SPI
+ *					 bridge and the allowlisted modules are set up, so a function
+ *					 body cannot escape the language (no extern, inline C, eval,
+ *					 evalcmd, native/off-allowlist using, or dangerous prelude
+ *					 functions). DESIGN.md section 9.
+ *	 pg_pureu	 untrusted; superuser only. Its interpreter is unrestricted, so
+ *					 Pure code may call any C function through extern -- the
+ *					 plperlu analogue.
  *
  * A function body is a single Pure expression over the SQL argument names.
  * It is compiled once per backend as
@@ -71,11 +74,23 @@ PG_FUNCTION_INFO_V1(pg_pureu_validator);
 
 void		_PG_init(void);
 
+static Datum call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo);
+static Datum inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo);
+static void validate_function(const char *lang, bool trusted, Oid fn_oid, FunctionCallInfo fcinfo);
+
 /* GUC: modules every interpreter loads. */
 static char *pg_pure_using = NULL;
 
-/* One interpreter per backend (backends are processes). */
-static pure_interp *interp = NULL;
+/*
+ * Two interpreters per backend (backends are processes): an unrestricted one
+ * for pg_pureu, and a sandboxed (--safe, armed) one for the trusted pg_pure.
+ * They must not be shared: once armed, the safe interpreter refuses the
+ * externs the untrusted setup needs. Each is created on first use of its
+ * language. Symbols (sql::null, sql::error) have the same numeric tag in
+ * either interpreter because libpure's symbol table is process-global.
+ */
+static pure_interp *interp_untrusted = NULL;
+static pure_interp *interp_trusted = NULL;
 static int32_t sym_sql_null = 0;
 static int32_t sym_sql_error = 0;
 
@@ -85,6 +100,7 @@ typedef struct CachedFunc
 	TransactionId fn_xmin;
 	ItemPointerData fn_tid;
 	pure_expr  *fun;			/* the compiled closure, pure_new'd */
+	pure_interp *ip;			/* the interpreter it was compiled in */
 	int			nargs;
 	Oid			argtypes[FUNC_MAX_ARGS];
 	Oid			rettype;
@@ -97,7 +113,7 @@ static CachedFunc *func_cache = NULL;
 static ErrorData *pending_pg_error = NULL;
 
 static pure_expr *datum_to_pure(Datum d, bool isnull, Oid type);
-static void ensure_interp(void);
+static pure_interp *ensure_interp(bool trusted);
 
 /* --- cooperative cancel ------------------------------------------------ */
 
@@ -111,10 +127,15 @@ interrupt_hook(void)
 static void
 pg_pure_exit(int code, Datum arg)
 {
-	if (interp)
+	if (interp_untrusted)
 	{
-		pure_delete_interp(interp);
-		interp = NULL;
+		pure_delete_interp(interp_untrusted);
+		interp_untrusted = NULL;
+	}
+	if (interp_trusted)
+	{
+		pure_delete_interp(interp_trusted);
+		interp_trusted = NULL;
 	}
 }
 
@@ -646,19 +667,27 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 
 /* --- interpreter and function cache ------------------------------------ */
 
-static void
-ensure_interp(void)
+/*
+ * Return the backend's interpreter for the given language trust, creating it
+ * on first use. The untrusted interpreter is unrestricted; the trusted one is
+ * created with --safe, set up with the SPI bridge and the allowlisted modules
+ * while still trusted, then armed so user code cannot escape the language.
+ */
+static pure_interp *
+ensure_interp(bool trusted)
 {
-	char	   *argv[] = {"pg_pure", NULL};
+	char	   *argv_u[] = {"pg_pure", NULL};
+	char	   *argv_s[] = {"pg_pure", "--safe", NULL};
+	pure_interp **slot = trusted ? &interp_trusted : &interp_untrusted;
 	pure_interp *ip;
 	pure_expr  *x;
 	int32_t		two = 0;
 	const char *problem = NULL;
 	StringInfoData setup;
 
-	if (interp)
-		return;
-	ip = pure_create_interp(1, argv);
+	if (*slot)
+		return *slot;
+	ip = trusted ? pure_create_interp(2, argv_s) : pure_create_interp(1, argv_u);
 	if (!ip)
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
@@ -666,13 +695,13 @@ ensure_interp(void)
 	pure_switch_interp(ip);
 
 	/*
-	 * Load the configured modules, declare the sql namespace (sql::null and
-	 * sql::error must be constant symbols, or they would be variables in
-	 * patterns), and bind the SPI/notice externs.
+	 * Declare the sql namespace (sql::null and sql::error must be constant
+	 * symbols, or they would be variables in patterns) and bind the SPI/notice
+	 * externs. In the trusted interpreter this must happen before arming,
+	 * because arming refuses all externs; these are pg_pure's own C functions
+	 * and are safe.
 	 */
 	initStringInfo(&setup);
-	if (pg_pure_using && *pg_pure_using)
-		appendStringInfo(&setup, "using %s;", pg_pure_using);
 	appendStringInfoString(&setup,
 						   "namespace sql;\n"
 						   "nonfix null;\n"
@@ -686,8 +715,41 @@ ensure_interp(void)
 	pfree(setup.data);
 	if (!x && *lasterr())
 		problem = pstrdup(lasterr());
-	else
+
+	/*
+	 * Load the configured modules. In the trusted interpreter, load each one
+	 * while still trusted and then allow it, so armed user code may say
+	 * "using <module>;" for a vetted module. A module that itself declares
+	 * externs (math declares log, pure_rational, ...) must be loaded here.
+	 */
+	if (!problem && pg_pure_using && *pg_pure_using)
 	{
+		char	   *list = pstrdup(pg_pure_using);
+		char	   *tok;
+
+		for (tok = strtok(list, " ,\t"); tok && !problem; tok = strtok(NULL, " ,\t"))
+		{
+			StringInfoData u;
+
+			initStringInfo(&u);
+			appendStringInfo(&u, "using %s;", tok);
+			clear_lasterr();
+			x = pure_eval(u.data);
+			pfree(u.data);
+			if (!x && *lasterr())
+			{
+				problem = psprintf("cannot load module \"%s\": %s", tok, lasterr());
+				break;
+			}
+			if (trusted)
+				pure_safe_allow_using(tok);
+		}
+		pfree(list);
+	}
+
+	if (!problem)
+	{
+		clear_lasterr();
 		x = pure_eval("1+1");
 		if (!x || !pure_is_int(x, &two) || two != 2)
 			problem = "the Pure prelude did not load; set PURELIB in the "
@@ -700,15 +762,23 @@ ensure_interp(void)
 		pure_delete_interp(ip);
 		ereport(ERROR,
 				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
-				 errmsg("pg_pure: cannot set up the interpreter: %s", problem)));
+				 errmsg("pg_pure: cannot set up the %s interpreter: %s",
+						trusted ? "trusted" : "untrusted", problem)));
 	}
+
+	/* Turn on sandbox enforcement last, after all trusted setup is done. */
+	if (trusted)
+		pure_safe_arm();
+
 	sym_sql_null = pure_sym("sql::null");
 	sym_sql_error = pure_sym("sql::error");
 	pure_set_interrupt_hook(interrupt_hook);
 	if (!IsUnderPostmaster)
-		return;					/* preloading: the postmaster keeps it for fork */
-	on_proc_exit(pg_pure_exit, 0);
-	interp = ip;
+		return ip;				/* preloading: the postmaster keeps it for fork */
+	if (!interp_untrusted && !interp_trusted)
+		on_proc_exit(pg_pure_exit, 0);
+	*slot = ip;
+	return ip;
 }
 
 static void
@@ -721,7 +791,7 @@ set_stack_limit(void)
 }
 
 static CachedFunc *
-compile_function(const char *lang, Oid fn_oid)
+compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 {
 	HeapTuple	tup;
 	Form_pg_proc proc;
@@ -742,7 +812,7 @@ compile_function(const char *lang, Oid fn_oid)
 	proc = (Form_pg_proc) GETSTRUCT(tup);
 
 	for (cf = func_cache; cf; cf = cf->next)
-		if (cf->fn_oid == fn_oid)
+		if (cf->fn_oid == fn_oid && cf->ip == ip)
 		{
 			if (cf->fn_xmin == HeapTupleHeaderGetRawXmin(tup->t_data) &&
 				ItemPointerEquals(&cf->fn_tid, &tup->t_self))
@@ -812,7 +882,7 @@ compile_function(const char *lang, Oid fn_oid)
 	appendStringInfo(&def, " = (%s);\n%s;", body, fname);
 
 	set_stack_limit();
-	pure_switch_interp(interp);
+	pure_switch_interp(ip);
 	if (cf)
 	{
 		/* CREATE OR REPLACE: drop old rules, which Pure appends to otherwise. */
@@ -847,6 +917,7 @@ compile_function(const char *lang, Oid fn_oid)
 	else if (cf->fun)
 		pure_free(cf->fun);
 	cf->fn_oid = fn_oid;
+	cf->ip = ip;
 	cf->fn_xmin = HeapTupleHeaderGetRawXmin(tup->t_data);
 	cf->fn_tid = tup->t_self;
 	cf->fun = pure_new(fun);
@@ -860,8 +931,9 @@ compile_function(const char *lang, Oid fn_oid)
 /* --- entry points ------------------------------------------------------ */
 
 static Datum
-call_function(const char *lang, FunctionCallInfo fcinfo)
+call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 {
+	pure_interp *ip;
 	CachedFunc *cf;
 	pure_expr  *args[FUNC_MAX_ARGS];
 	pure_expr  *res,
@@ -877,9 +949,9 @@ call_function(const char *lang, FunctionCallInfo fcinfo)
 	if (CALLED_AS_EVENT_TRIGGER(fcinfo))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("%s does not support event triggers yet", lang)));
-	ensure_interp();
-	pure_switch_interp(interp);
-	cf = compile_function(lang, fcinfo->flinfo->fn_oid);
+	ip = ensure_interp(trusted);
+	pure_switch_interp(ip);
+	cf = compile_function(lang, ip, fcinfo->flinfo->fn_oid);
 
 	/* Convert arguments outside of any Pure call: they may ereport. */
 	for (int i = 0; i < cf->nargs; i++)
@@ -927,71 +999,57 @@ call_function(const char *lang, FunctionCallInfo fcinfo)
 }
 
 static void
-validate_function(const char *lang, Oid fn_oid, FunctionCallInfo fcinfo)
+validate_function(const char *lang, bool trusted, Oid fn_oid, FunctionCallInfo fcinfo)
 {
+	pure_interp *ip;
+
 	if (!CheckFunctionValidatorAccess(fcinfo->flinfo->fn_oid, fn_oid))
 		return;
 	if (!check_function_bodies)
 		return;
-	ensure_interp();
-	pure_switch_interp(interp);
-	(void) compile_function(lang, fn_oid);
-}
-
-/*
- * The trusted language has no safe-mode interpreter yet (DESIGN.md section
- * 9), so it must not run untrusted Pure code. Refuse clearly rather than
- * pretend to be trusted.
- */
-static void
-pg_pure_trusted_unsupported(void)
-{
-	ereport(ERROR,
-			(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-			 errmsg("pg_pure (trusted) is not available in this version"),
-			 errhint("Use pg_pureu as a superuser, or wait for the "
-					 "sandboxed pg_pure. See the pg_pure documentation.")));
+	ip = ensure_interp(trusted);
+	pure_switch_interp(ip);
+	(void) compile_function(lang, ip, fn_oid);
 }
 
 Datum
 pg_pure_call_handler(PG_FUNCTION_ARGS)
 {
-	pg_pure_trusted_unsupported();
-	PG_RETURN_NULL();
+	return call_function("pg_pure", true, fcinfo);
 }
 
 Datum
 pg_pure_inline_handler(PG_FUNCTION_ARGS)
 {
-	pg_pure_trusted_unsupported();
-	PG_RETURN_VOID();
+	return inline_block("pg_pure", true, fcinfo);
 }
 
 Datum
 pg_pure_validator(PG_FUNCTION_ARGS)
 {
-	/* Allow the catalog entry to be created; refuse at call time. */
+	validate_function("pg_pure", true, PG_GETARG_OID(0), fcinfo);
 	PG_RETURN_VOID();
 }
 
 Datum
 pg_pureu_call_handler(PG_FUNCTION_ARGS)
 {
-	return call_function("pg_pureu", fcinfo);
+	return call_function("pg_pureu", false, fcinfo);
 }
 
-Datum
-pg_pureu_inline_handler(PG_FUNCTION_ARGS)
+static Datum
+inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 {
 	InlineCodeBlock *codeblock = (InlineCodeBlock *) DatumGetPointer(PG_GETARG_DATUM(0));
+	pure_interp *ip;
 	pure_expr  *res,
 			   *exc = NULL;
 	StringInfoData def;
 	char	   *out;
 	int			rc;
 
-	ensure_interp();
-	pure_switch_interp(interp);
+	ip = ensure_interp(trusted);
+	pure_switch_interp(ip);
 	set_stack_limit();
 	/* Compile the block as a temporary niladic function, call, then clear. */
 	initStringInfo(&def);
@@ -1007,7 +1065,7 @@ pg_pureu_inline_handler(PG_FUNCTION_ARGS)
 		pfree(def.data);
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("pg_pureu: cannot compile DO block"),
+				 errmsg("%s: cannot compile DO block", lang),
 				 errdetail("%s", e)));
 	}
 	pfree(def.data);
@@ -1026,7 +1084,7 @@ pg_pureu_inline_handler(PG_FUNCTION_ARGS)
 	if (!res)
 	{
 		SPI_finish();
-		report_pure_failure("pg_pureu", "uncaught exception in DO block", exc);
+		report_pure_failure(lang, "uncaught exception in DO block", exc);
 	}
 	pure_freenew(res);
 	SPI_finish();
@@ -1034,9 +1092,15 @@ pg_pureu_inline_handler(PG_FUNCTION_ARGS)
 }
 
 Datum
+pg_pureu_inline_handler(PG_FUNCTION_ARGS)
+{
+	return inline_block("pg_pureu", false, fcinfo);
+}
+
+Datum
 pg_pureu_validator(PG_FUNCTION_ARGS)
 {
-	validate_function("pg_pureu", PG_GETARG_OID(0), fcinfo);
+	validate_function("pg_pureu", false, PG_GETARG_OID(0), fcinfo);
 	PG_RETURN_VOID();
 }
 
@@ -1060,22 +1124,24 @@ _PG_init(void)
 	MarkGUCPrefixReserved("pg_pure");
 
 	/*
-	 * When preloaded, build and warm the interpreter in the postmaster so
-	 * every backend inherits it through fork. The first warm call pays the
+	 * When preloaded, build and warm both interpreters in the postmaster so
+	 * every backend inherits them through fork. The first warm call pays the
 	 * one-time LLVM codegen cost once, not per backend. DESIGN.md section 3.
 	 */
 	if (process_shared_preload_libraries_in_progress)
 	{
-		pure_expr  *w;
+		for (int t = 0; t < 2; t++)
+		{
+			pure_interp *ip = ensure_interp(t == 1);
+			pure_expr  *w;
+			char	   *out;
 
-		char	   *out;
-
-		ensure_interp();
-		pure_switch_interp(interp);
-		w = pure_eval("__pg_pure_warm x y = (x*y+1); __pg_pure_warm 6 7;");
-		if (w)
-			pure_freenew(w);
-		out = pure_evalcmd("clear __pg_pure_warm\n");
-		free(out);
+			pure_switch_interp(ip);
+			w = pure_eval("__pg_pure_warm x y = (x*y+1); __pg_pure_warm 6 7;");
+			if (w)
+				pure_freenew(w);
+			out = pure_evalcmd("clear __pg_pure_warm\n");
+			free(out);
+		}
 	}
 }

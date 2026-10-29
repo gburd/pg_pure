@@ -4,6 +4,28 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.2.0] - 2026-10-29
+
+### Added
+- **The trusted language `pg_pure` now runs.** It executes each function in a
+  libpure safe-mode interpreter (`--safe`, armed after the SPI bridge and the
+  `pg_pure.using` modules are set up), so any user may create `pg_pure`
+  functions. A body that attempts `extern`, inline C, `eval`/`evalcmd`, a
+  native or non-allowlisted `using`, or a dangerous prelude function (`exit`,
+  `malloc`, raw pointers) is refused as an SQL ERROR and the backend
+  survives. `sql/pg_pure.sql` exercises each route. Previously `pg_pure`
+  refused to run and only `pg_pureu` worked.
+- Trusted and untrusted each get their own backend-local interpreter; the
+  function cache keys on the interpreter so the two never collide.
+
+### Changed
+- Requires libpure from the fork at `libpure-embeddable` >= `ab12de13` (it
+  provides the safe-mode API and hides its LLVM symbols).
+- Dropped the "install PostgreSQL without its `-jit` package" guidance: the
+  fork's libpure no longer exports LLVM symbols, so pg_pure runs on a normal
+  `jit = on` server. Both suites pass with `jit_above_cost = 0` on
+  PostgreSQL 17/18/19 with zero backend crashes.
+
 ## [0.1.1] - 2026-10-28
 
 ### Fixed

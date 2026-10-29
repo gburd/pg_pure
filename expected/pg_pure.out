@@ -1,0 +1,118 @@
+CREATE EXTENSION IF NOT EXISTS pg_pure;
+-- pg_pure is the TRUSTED language: a non-superuser may create functions, and
+-- the sandbox (libpure --safe, armed) stops a body escaping the language.
+-- a normal trusted function works
+CREATE FUNCTION tmul(x int, y int) RETURNS int LANGUAGE pg_pure AS 'x*y+1';
+SELECT tmul(6, 7);
+ tmul 
+------
+   43
+(1 row)
+
+-- exact bigint / numeric, same as pg_pureu
+CREATE FUNCTION tfact(n int) RETURNS numeric LANGUAGE pg_pure AS 'foldl (*) 1L (1..n)';
+SELECT tfact(20);
+        tfact        
+---------------------
+ 2432902008176640000
+(1 row)
+
+-- a vetted module on the allowlist (math, loaded by default) is usable
+CREATE FUNCTION thalf(x numeric) RETURNS numeric LANGUAGE pg_pure AS 'using math; x/2';
+SELECT thalf(5);
+ thalf 
+-------
+   2.5
+(1 row)
+
+-- SPI works in the trusted language too
+CREATE TABLE tt (k int);
+INSERT INTO tt VALUES (10), (20), (30);
+CREATE FUNCTION tsum() RETURNS int LANGUAGE pg_pure AS
+  'foldl (+) 0 (sql::query "SELECT k FROM tt")';
+SELECT tsum();
+ tsum 
+------
+   60
+(1 row)
+
+-- NULL and the sql namespace behave as in pg_pureu
+CREATE FUNCTION tnull(x int) RETURNS int LANGUAGE pg_pure AS
+  'case x of sql::null = -1; _ = x end';
+SELECT tnull(NULL), tnull(5);
+ tnull | tnull 
+-------+-------
+    -1 |     5
+(1 row)
+
+-- --- the sandbox refuses every route out of the language ---------------
+-- Each of these must raise an SQL ERROR (not crash the backend), and a normal
+-- call must still work afterward.
+-- an extern declaration is refused at compile time
+CREATE FUNCTION textern(x int) RETURNS int LANGUAGE pg_pure AS
+  'x with f = extern int system(char*) end';
+ERROR:  pg_pure: cannot compile function "textern"
+DETAIL:  <stdin>, line 1: syntax error, unexpected extern
+
+SELECT tmul(2, 2);   -- backend survived
+ tmul 
+------
+    5
+(1 row)
+
+-- eval is refused
+CREATE FUNCTION teval(x int) RETURNS int LANGUAGE pg_pure AS 'eval "1+1"';
+SELECT teval(1);
+ERROR:  pg_pure: uncaught exception: safe_mode_violation
+SELECT tmul(2, 2);
+ tmul 
+------
+    5
+(1 row)
+
+-- a dangerous prelude function (exit) never bound, so a call to it does not
+-- terminate the backend; it is an unevaluated normal form, rejected as a type
+-- mismatch, and the session keeps working
+CREATE FUNCTION texit(x int) RETURNS int LANGUAGE pg_pure AS 'exit 1';
+SELECT texit(1);
+ERROR:  pg_pure: result exit 1 cannot be converted to integer
+HINT:  Check the argument types your rules expect; an unmatched application stays unevaluated in Pure.
+SELECT tmul(2, 2);   -- the backend is still alive
+ tmul 
+------
+    5
+(1 row)
+
+-- malloc is likewise unavailable: in safe mode it never binds to C, so
+-- "malloc 8" stays the unevaluated symbol (str shows "malloc 8", not a
+-- #<pointer ...>), proving no allocation happened. The backend survives.
+CREATE FUNCTION tmalloc(x int) RETURNS text LANGUAGE pg_pure AS 'str (malloc 8)';
+SELECT tmalloc(1);
+ tmalloc  
+----------
+ malloc 8
+(1 row)
+
+SELECT tmul(2, 2);
+ tmul 
+------
+    5
+(1 row)
+
+-- using a native module (lib:) is refused at compile time
+CREATE FUNCTION tnative(x int) RETURNS int LANGUAGE pg_pure AS
+  'using "lib:nonesuch"; x';
+ERROR:  pg_pure: cannot compile function "tnative"
+DETAIL:  <stdin>, line 1: using lib: is not allowed in safe mode
+
+-- using a module not on the allowlist is refused at compile time
+CREATE FUNCTION tsys(x int) RETURNS int LANGUAGE pg_pure AS 'using system; x';
+ERROR:  pg_pure: cannot compile function "tsys"
+DETAIL:  <stdin>, line 1: module 'system.pure' is not on the safe-mode allowlist
+
+SELECT tmul(2, 2);   -- still alive after all of the above
+ tmul 
+------
+    5
+(1 row)
+

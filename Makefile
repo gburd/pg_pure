@@ -20,7 +20,7 @@ OBJS = pg_pure.o
 EXTENSION = pg_pure pg_pureu
 DATA = pg_pure--0.1.sql pg_pureu--0.1.sql
 
-REGRESS = pg_pureu
+REGRESS = pg_pureu pg_pure
 
 PG_CPPFLAGS = -I$(PURE_PREFIX)/include
 SHLIB_LINK = -L$(PURE_PREFIX)/lib -Wl,-rpath,$(PURE_PREFIX)/lib -lpure

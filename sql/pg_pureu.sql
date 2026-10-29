@@ -129,10 +129,5 @@ SELECT count(*) FROM do_marker;
 -- unsupported types are rejected up front
 CREATE FUNCTION pjson(x json) RETURNS int LANGUAGE pg_pureu AS '1';
 
--- the trusted language exists but refuses to run in this version
-CREATE EXTENSION pg_pure;
-CREATE FUNCTION ptrusted(x int) RETURNS int LANGUAGE pg_pure AS 'x+1';
-SELECT ptrusted(1);
-
 -- many calls of a compiled function in one statement
 SELECT sum(pmul(i, 2)) FROM generate_series(1, 100000) i;

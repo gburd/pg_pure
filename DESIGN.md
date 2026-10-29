@@ -34,21 +34,21 @@ same handler function. Tom Lane hit this when plperl and plpython became
 extensions:
 https://pg.ddx.io/m/pgsql-hackers/27364.1299286724@sss.pgh.pa.us/
 
-## 1a. Status, 2026-10-27
+## 1a. Status, 2026-10-29
 
-The untrusted language is built and passes. `pg_pure.c` (about 1080 lines)
-backs both languages; `CREATE EXTENSION pl_pure_untrusted` then
-`CREATE FUNCTION ... LANGUAGE pl_pure_untrusted` works, and its regression
-suite (`sql/pl_pure_untrusted.sql`, 1 file) passes against PostgreSQL 18 on
-the box with the version-script'd libpure. The six prototype defects in
-section 8 are fixed and each has a regression case: exact numeric round-trips
-(`12345678901234567890.123456789` in and out unchanged), an int2 result of
-70000 is an ERROR, an int8 overflow is an ERROR, a non-string text result is
-an ERROR, and a `;` in a body no longer leaks a global rule. The crash matrix
-(PostgreSQL JIT and Pure in one backend, both orders, three runs each) shows
-0 crashes. `pl_pure` is installable and refuses to run, as described above.
-Still missing from phase 1: set-returning functions, triggers, preload
-warm-up wired into `_PG_init` (the code is there but untested end to end),
+Both languages are built and pass. `pg_pure.c` backs `pg_pure` (trusted) and
+`pg_pureu` (untrusted), each with its own backend-local interpreter.
+`CREATE EXTENSION pg_pureu` / `pg_pure` then `CREATE FUNCTION ... LANGUAGE ...`
+works; the two regression suites (`sql/pg_pureu.sql`, `sql/pg_pure.sql`) pass
+on PostgreSQL 17, 18 and 19, with `jit=on` and `jit_above_cost=0` (so a
+JIT-compiled SQL query and a Pure function run in the same backend), 0
+crashes. The six prototype defects in section 8 are fixed and each has a
+regression case. The trusted `pg_pure` runs in a libpure `--safe` interpreter
+(section 9): a function body that tries `extern`, `eval`, inline code, a
+native or off-allowlist `using`, or a dangerous prelude function (`exit`,
+`malloc`) is refused as an SQL ERROR and the backend survives; each is a
+regression case in `sql/pg_pure.sql`. Still missing: set-returning functions,
+triggers, parameterized SPI, per-SQL-user trusted interpreters (section 9.4),
 and the TAP suite. See ROADMAP.md.
 
 ## 2. How users write Pure in PostgreSQL
@@ -318,67 +318,48 @@ What follows from the table:
      kept across calls are the cached function closures.
 - **libpure must not export LLVM symbols.** See section 5.
 
-## 5. The LLVM symbol clash (blocking)
+## 5. The LLVM symbol clash (fixed in libpure)
 
-PGDG's PostgreSQL 17 and 18 packages for Debian 13 ship `llvmjit.so` linked
-against libLLVM 19.1, while libpure links libLLVM 21.1. Both can end up in
-the same backend: `jit = on` is the default, and PostgreSQL JIT-compiles any
-query that costs more than `jit_above_cost` (100000).
+This was the original blocker and is now resolved in the fork; it is kept
+here because the pg_pure test suite still guards against it.
 
-libpure exports about 200 C++ symbols that are template instances over LLVM
-types, for example
-`std::_Sp_counted_ptr_inplace<llvm::orc::ThreadSafeContext::State, ...>::_M_dispose`.
-The dynamic linker binds the other LLVM's references to libpure's copies.
-When the backend exits, LLVM 19's ORC teardown runs code built against LLVM
-21, and the backend dies with SIGSEGV. A backend crash makes the postmaster
-restart every backend, so one crash takes down every session on the server.
+PGDG's PostgreSQL packages ship `llvmjit.so` linked against one libLLVM
+major, while libpure links another (Debian 13: 19 vs 21). Both can end up in
+the same backend, because `jit = on` is the default and PostgreSQL
+JIT-compiles any query over `jit_above_cost`. libpure used to export its C++
+template instances over `llvm::` types; the dynamic linker bound the other
+LLVM's references to libpure's copies, and at backend exit one LLVM tore down
+objects built by the other, so the backend died with SIGSEGV. One backend
+crash restarts every session.
 
-The fix is to link libpure with `-Wl,-Bsymbolic` and a version script that
-hides `*4llvm*` symbols, and to link the `pure` executable directly against
-libLLVM, since it had been getting LLVM symbols through libpure. Each case
-below ran on a fresh server with a fresh backend. A case counted only after
-both query results came back correct:
+**Fixed in libpure** (fork `gburd/pure-lang`, branch `libpure-embeddable`,
+commit "Hide libpure's LLVM symbols ..."): the ELF `libpure.so` no longer
+exports any `llvm::` symbol. This is automatic -- pg_pure links the fixed
+libpure and needs no change, and the "install PostgreSQL without its -jit
+package" workaround (old section 5a) is no longer required.
 
-| libpure build | Pure only | PG JIT only | Pure, then PG JIT | PG JIT, then Pure |
-|---|---|---|---|---|
-| stock | ok | ok | SIGSEGV | SIGSEGV |
-| `-Bsymbolic` | ok | ok | SIGSEGV | ok |
-| `-Bsymbolic` plus the version script (0 LLVM exports) | ok 3/3 | ok 3/3 | ok 3/3 | ok 3/3 |
+Verified on Debian 13 (PG 17/18/19, `llvmjit` = libLLVM 19, libpure = LLVM
+21): with the fixed libpure, `nm -D libpure.so | c++filt | grep llvm::` is
+empty, libpure's own `make check` passes 95/95, and both pg_pure regression
+suites pass with `jit=on, jit_above_cost=0` (a JIT-compiled query and a Pure
+function in one backend) with 0 "terminated by signal" in the log, on all
+three majors. The pg_pure suite keeps a crash-matrix check (ROADMAP 1.7) so a
+future libpure that re-exports LLVM is caught.
 
-With the fix, libpure's `make check` still passes 95 tests, the same as the
-stock build, and `make check-embed` passes. The prototype's regression
-output is unchanged with `jit_above_cost = 0`.
+### 5a. If a future libpure regresses this
 
-This is a libpure change, so it goes to the fork (open question 3). The
-pg_pure test suite keeps a test that exercises PostgreSQL JIT and Pure in
-the same backend, in both orders, and reads the server log for "terminated
-by signal". Verified: with the fixed libpure, the pg_pure extension (not
-just the prototype) runs the matrix 0-crash, 3 runs each, on a PG 18 server
-with JIT forced on (`jit_above_cost = 0`).
+The symbol hiding is in libpure now, so no pg_pure deployment needs a
+workaround. If a future libpure build regressed it (re-exported `llvm::`),
+the crash would return, and these are the fallbacks:
 
-### 5a. Two other ways to avoid the clash
+- **A PostgreSQL built without LLVM.** On Debian `llvmjit.so` is a separate
+  package (`postgresql-NN-jit`); with it uninstalled, no backend loads
+  libLLVM and `jit = on` is a silent no-op, so even a libpure that exports
+  LLVM symbols cannot clash. The server loses its own JIT.
+- **A PostgreSQL built against the same LLVM major as libpure.** One copy of
+  libLLVM, no interposition.
 
-The `-Bsymbolic` fix lets libpure (LLVM 21) and `llvmjit` (LLVM 19) coexist.
-There are two situations where the fix is not even needed:
-
-- **A PostgreSQL built without LLVM.** On Debian, `llvmjit.so` is a separate
-  package (`postgresql-18-jit`). With it uninstalled, no backend ever loads
-  libLLVM, and `jit = on` is silently a no-op. The stock libpure (LLVM
-  symbols still exported) then runs 0-crash with `jit = on` and
-  `jit_above_cost = 0` (verified). So one supported deployment is: install
-  PostgreSQL without the JIT package, and pg_pure works with any libpure
-  build. The server loses its own JIT, which for most pg_pure workloads is a
-  fair trade.
-- **A PostgreSQL built against the same LLVM major as libpure.** When the
-  server's `llvmjit` and libpure both link libLLVM 21, there is one copy and
-  no interposition. This is the path the LLVM-21 upgrade work makes
-  available. Not yet tested here, because PGDG's `llvmjit` for Debian 13 is
-  pinned to libLLVM 19; it will be exercised by the from-source cassert
-  build in phase 1.8.
-
-The `-Bsymbolic` fix is kept regardless, because it is the only option that
-works with a stock PGDG server (LLVM 19) and an LLVM-21 libpure in the same
-backend, and it costs nothing when the other two conditions also hold.
+The crash-matrix test (ROADMAP 1.7) is what catches a regression; keep it.
 
 ## 6. Pure behaviour users need to know
 
@@ -436,27 +417,59 @@ Each item was reproduced on the box. v1 fixes all of them:
    `tcop/tcopprot.h` there and in `miscadmin.h` in 18. With that one
    include fixed, its regression output is identical on 17 and 18.
 
-## 9. The trusted language, `pl_pure`
+## 9. The trusted language, `pg_pure`
 
 A Pure program can call any C function through an `extern` declaration. The
 standard prelude itself declares `system`, `popen`, `fopen` and `exit`, plus
 `malloc`, `free` and pointer access. Pure also has inline C (`%< ... %>`,
-which runs clang), `eval` and `evalcmd`, and `using` of any file on disk.
-libpure has a `restricted` flag, but it only blocks a few interpreter
-operations and is no sandbox. A trusted language therefore needs a "safe
-mode" in libpure that:
+which runs clang), `eval` and `evalcmd`, and `using` of any file on disk. So
+untrusted Pure is as powerful as a C extension, and a trusted language must
+fence all of it off.
 
-- rejects `extern`, inline code, `eval` and `evalcmd`, and `using` outside
-  an allowlist;
-- loads a curated prelude without the system, posix and pointer modules;
-- runs one interpreter per SQL user, as trusted PL/Perl does, so that
-  SECURITY DEFINER functions cannot share state across users.
+**libpure provides a safe mode** (fork `libpure-embeddable`, commit "Add a
+safe mode ..."), and pg_pure uses it for the trusted language. The API:
 
-Each per-user interpreter costs the full creation price (1.5 s, about
-100 MB) because an interpreter cannot be cloned. Any sandbox escape gives
-the OS user that runs PostgreSQL to whoever can create functions. This is
-the riskiest part of the project. It is a separate phase, and it starts only
-after the libpure safe-mode design has been reviewed (open question 4).
+    int pure_is_safe(void);
+    int pure_safe_allow_using(const char *name);
+    int pure_safe_arm(void);
+
+pg_pure gives the trusted and untrusted languages **separate backend-local
+interpreters**, as trusted PL/Perl does. `ensure_interp(trusted)` builds the
+right one on first use:
+
+- The untrusted interpreter (`pg_pureu`) is created normally: unrestricted.
+- The trusted interpreter (`pg_pure`) is created with `--safe`. While still
+  unarmed, pg_pure declares its own SPI/notice externs (they are safe) and
+  loads each module in `pg_pure.using`, calling `pure_safe_allow_using` for
+  each so armed user code may re-reference it. Then `pure_safe_arm()` turns
+  enforcement on.
+
+After arming, a function body is refused if it uses `extern`, inline code,
+`eval`, `evalcmd`, or `using` of a native (`lib:`/`bc:`/`dsp:`) or
+off-allowlist module; the refusal is a Pure error that the handler turns into
+an SQL ERROR. The dangerous prelude functions (`exit`, `malloc`, `free`, raw
+pointer access) are refused when the prelude declares them, so they never
+bind: a body that calls `exit 1` yields an unevaluated normal form (rejected
+by result conversion) and does **not** terminate the backend. Each of these
+is a regression case in `sql/pg_pure.sql`, verified on PG 17/18/19.
+
+### 9.4 Still to do: one interpreter per SQL user
+
+The trusted language currently uses a single armed interpreter for all
+`pg_pure` functions in a backend. DESIGN wants one per SQL user so that
+SECURITY DEFINER functions cannot share interpreter state; that is a separate
+step (key the interpreter by `GetUserId()`), weighed against the per-user
+cost (about 1.5 s and 100+ MB; an interpreter cannot be cloned).
+
+### 9.5 Still to do: a curated prelude
+
+The safe mode is a denylist (the dangerous externs are refused at
+declaration). The stronger end state is a curated `--safe` prelude that never
+declares them at all; libpure exposes the source option `safe` for writing
+one. That design goes to the Pure maintainer, and the trusted language wants
+an independent security review before it is relied on for untrusted
+multi-tenant use. Until then the denylist plus arming is what stands between
+a `pg_pure` function and the host.
 
 ## 10. Platforms
 
@@ -464,9 +477,9 @@ Tested (regression suite green, 0 backend crashes):
 
 - **Linux (Debian 13)**, PostgreSQL 17, 18 and 19, libpure on LLVM 21.
 - **FreeBSD 14.5**, PostgreSQL 17, libpure on LLVM 21. pg_pure built clean
-  against the fork's libpure with no source change; the suite passed on a
-  JIT-off cluster (FreeBSD's PG 17 llvmjit is LLVM 19, so the same
-  coexistence rule applies as on Debian, section 5a).
+  against the fork's libpure with no source change; the suite passed with
+  the libpure symbol fix in place, so no JIT workaround was needed (verified
+  2026-10-28 on an earlier release; re-verify on the next FreeBSD run).
 
 Not planned:
 
@@ -489,9 +502,9 @@ Not planned:
 
 ## 11. Open questions
 
-1. **Naming.** Decided (Greg, 2026-10-27): `pl_pure` is the trusted
-   language and the one we ship; `pl_pure_untrusted` is the superuser-only
-   one. Both are separate extensions over the one `pg_pure.so`.
+1. **Naming.** Decided (Greg, 2026-10-27): `pg_pure` is the trusted language
+   and the one we ship; `pg_pureu` is the untrusted, superuser-only one.
+   Both are separate extensions over the one `pg_pure.so`.
 2. **int4 semantics.** Still open. One option is Pure's machine ints: wraps
    go undetected inside a computation (the result is still range-checked on
    return), but the prelude and literal patterns (`f 0 = ...`) work. The
@@ -499,12 +512,9 @@ Not planned:
    about 2x the per-call cost (427 ns against 216 ns), and `take n xs` or
    `f 0 = ...` stop working for SQL integers. The built extension uses
    machine ints for int2/int4 and bigints for int8.
-3. **Where the libpure symbol fix lands.** It could be a new commit on PR
-   #48's branch (the PR is titled "Make libpure.so safe to embed in a host
-   that owns the process") or a separate PR. Greg is separately moving
-   PostgreSQL to LLVM 21, which removes the clash for a from-source server
-   (section 5a); the fix is still wanted for stock PGDG servers.
-4. **The trusted language.** `pl_pure` is the ship target, so the libpure
-   safe mode (section 9) is on the critical path, not optional. The
-   remaining question is only whether safe mode is designed with the Pure
-   maintainer upstream or carried in the fork.
+3. **The libpure symbol fix** landed in the fork (`libpure-embeddable`,
+   commit "Hide libpure's LLVM symbols ..."). Resolved; section 5.
+4. **The trusted language** is implemented against libpure's safe mode
+   (section 9). Resolved for single-interpreter use. Remaining: per-SQL-user
+   interpreters (9.4), a curated `--safe` prelude (9.5), and an independent
+   security review before relying on it for untrusted multi-tenant use.

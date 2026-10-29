@@ -5,29 +5,22 @@ the working rules in `AGENTS.md`. Each phase ends with a gate. A phase is
 done when its gate has run on the EC2 box and the output shows that every
 test in it actually ran.
 
-## Phase 0: libpure prerequisites (in github.com/gburd/pure-lang)
+## Phase 0: libpure prerequisites (in github.com/gburd/pure-lang) -- DONE
 
-Needed only for a PostgreSQL that is itself linked against a DIFFERENT LLVM
-major than libpure (the stock PGDG case: server on LLVM 19, libpure on
-LLVM 21). A server built without LLVM, or against the same LLVM major, does
-not need this; DESIGN.md section 5a. The fix is proven out on the box
-(`~/src/pure-hidden`), so phase 0 here is about landing it in the fork.
+Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
 
-- [x] 0.1 (proven, not yet upstreamed) Stop libpure exporting LLVM symbols:
-      link with `-Wl,-Bsymbolic` and a version script hiding `*4llvm*`, and
-      link `pure` directly against libLLVM. Result: 0 `llvm::` exports,
-      libpure `make check` 95/95, `make check-embed` passes, and the pg_pure
-      extension runs the crash matrix 0-crash on a JIT-on PG 18 server.
-      Still to do: land it in the fork (branch off `libpure-embeddable`) and
-      add the `grep -c 'llvm::' == 0` assertion to `make check-embed`.
-- [ ] 0.2 Commit the reproducer (`jitmix.sh`: PostgreSQL JIT plus Pure in
-      one backend, in both orders; saved in `_/probes/jitmix.sh`) to the
-      fork under `test/`. It must fail on the stock libpure and pass on the
-      fixed one.
-
-Gate: libpure `make check` (95 passed) and `make check-embed`; the
-reproducer shows 0 crashes with the fix and 2 without it, on a PGDG server
-(LLVM 19) with an LLVM-21 libpure.
+- [x] 0.1 libpure no longer exports its LLVM symbols, so it cannot clash with
+      a host's `llvmjit` of a different LLVM major (commit "Hide libpure's
+      LLVM symbols ..."). pg_pure links it unchanged; the "PostgreSQL without
+      -jit" workaround is retired. Verified: 0 `llvm::` exports, libpure
+      `make check` 95/95, both pg_pure suites pass with `jit=on,
+      jit_above_cost=0` on PG 17/18/19, 0 crashes.
+- [x] 0.3 A safe mode (commit "Add a safe mode ..."): `pure_is_safe`,
+      `pure_safe_allow_using`, `pure_safe_arm`. This is what the trusted
+      `pg_pure` uses (phase 3).
+- [ ] 0.2 Keep a crash-matrix reproducer in pg_pure's TAP suite (ROADMAP 1.7)
+      so a future libpure that re-exports LLVM is caught. (Not in the fork;
+      it belongs here.)
 
 ## Phase 1: the extension (pg_pureu now, pg_pure on top)
 
@@ -93,17 +86,25 @@ Gate: phase 1 gate, plus the module tests and the property suite.
 
 ## Phase 3: the trusted language and the remaining PL features
 
-- [ ] 3.1 Design libpure's safe mode with the Pure maintainer before
-      writing code (DESIGN.md section 9).
-- [ ] 3.2 Implement safe mode in the fork, with escape tests: every route in
-      section 9 must be refused.
-- [ ] 3.3 `plpure` (trusted): curated prelude, one interpreter per SQL
-      user, `trusted = true` extension.
+- [x] 3.1/3.2 libpure safe mode designed and landed in the fork
+      (`pure_is_safe`/`pure_safe_allow_using`/`pure_safe_arm`); see phase 0.
+- [x] 3.3a `pg_pure` (trusted) runs each function in a `--safe`, armed
+      interpreter: a body attempting `extern`, inline code, `eval`/`evalcmd`,
+      a native or off-allowlist `using`, or a dangerous prelude function is
+      refused as an SQL ERROR and the backend survives. `sql/pg_pure.sql`
+      covers each route; passes on PG 17/18/19.
+- [ ] 3.3b One interpreter per SQL user (DESIGN.md 9.4): today a single armed
+      interpreter serves all `pg_pure` functions in a backend. Key it by
+      `GetUserId()` so SECURITY DEFINER functions cannot share state.
+- [ ] 3.3c A curated `--safe` prelude (DESIGN.md 9.5) instead of the denylist,
+      designed with the Pure maintainer; independent security review before
+      relying on the trusted language for untrusted multi-tenant use.
 - [ ] 3.4 Event triggers; transaction control in procedures (`sql::commit`,
       `sql::rollback`).
 
-Gate: phase 2 gate plus the escape suite, and an independent security
-review of the safe mode before any release that includes `plpure`.
+Gate: phase 2 gate plus the escape suite (have it in `sql/pg_pure.sql`), and
+an independent security review of the safe mode before relying on `pg_pure`
+for untrusted multi-tenant workloads.
 
 ## Phase 4: release
 
@@ -127,3 +128,7 @@ review of the safe mode before any release that includes `plpure`.
   supported deployment and needs no libpure symbol fix; it gives up the
   server's own JIT. DESIGN.md section 5a. (Greg is also moving PostgreSQL to
   LLVM 21 in a separate effort, which removes the clash a different way.)
+- 2026-10-29: libpure landed both fixes in the fork (`ab12de13`): LLVM
+  symbols hidden (no coexistence workaround needed) and a safe mode. pg_pure
+  0.2.0 wires the trusted `pg_pure` to the safe mode; both languages now run
+  and pass on PG 17/18/19 with `jit=on`.
