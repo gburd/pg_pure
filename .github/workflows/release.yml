@@ -53,8 +53,19 @@ jobs:
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
           sudo install -d /usr/share/postgresql-common/pgdg
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          # Retry + verify the signing key (a bare curl|tee hides a mid-stream
+          # failure and writes a truncated key, a recurring CI flake).
+          key=$(mktemp)
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+                 https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$key" \
+               && gpg --show-keys "$key" >/dev/null 2>&1; then
+              break
+            fi
+            echo "PGDG key fetch attempt $i failed; retrying"; sleep 5
+          done
+          gpg --show-keys "$key" >/dev/null 2>&1 || { echo "::error::could not fetch a valid PGDG signing key"; exit 1; }
+          sudo install -m 644 "$key" /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
           sudo apt-get update

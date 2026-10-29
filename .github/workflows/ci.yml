@@ -41,8 +41,21 @@ jobs:
         run: |
           sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/microsoft*.sources || true
           sudo install -d /usr/share/postgresql-common/pgdg
-          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
-            | sudo tee /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc >/dev/null
+          # Fetch the signing key with retries to a temp file and verify it
+          # before installing it. A bare `curl | tee` hides a mid-stream curl
+          # failure (the pipe's status is tee's), writing a truncated key that
+          # makes apt fail with a GPG error -- a recurring CI flake.
+          key=$(mktemp)
+          for i in 1 2 3 4 5; do
+            if curl -fsSL --retry 5 --retry-all-errors --retry-delay 3 \
+                 https://www.postgresql.org/media/keys/ACCC4CF8.asc -o "$key" \
+               && gpg --show-keys "$key" >/dev/null 2>&1; then
+              break
+            fi
+            echo "PGDG key fetch attempt $i failed; retrying"; sleep 5
+          done
+          gpg --show-keys "$key" >/dev/null 2>&1 || { echo "::error::could not fetch a valid PGDG signing key"; exit 1; }
+          sudo install -m 644 "$key" /usr/share/postgresql-common/pgdg/apt.postgresql.org.asc
           CODENAME=$(lsb_release -cs)
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
