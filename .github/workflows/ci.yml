@@ -103,9 +103,9 @@ jobs:
           make install
           # Build the add-on Pure modules the test suite uses (gsl::matrix).
           cd ../pure-gsl
-          PATH="$HOME/pure/bin:$PATH" PKG_CONFIG_PATH="$HOME/pure/lib/pkgconfig" \
-            make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" prefix="$HOME/pure"
-          PATH="$HOME/pure/bin:$PATH" make install prefix="$HOME/pure"
+          export PKG_CONFIG_PATH="$HOME/pure/lib/pkgconfig" PATH="$HOME/pure/bin:$PATH"
+          make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" libdir="$HOME/pure/lib"
+          make install libdir="$HOME/pure/lib"
 
       - name: Install PostgreSQL ${{ matrix.pg }} WITHOUT the JIT package
         run: |
