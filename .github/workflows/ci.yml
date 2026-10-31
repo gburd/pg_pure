@@ -71,7 +71,7 @@ jobs:
           curl -fsSL https://apt.llvm.org/llvm.sh | sudo bash -s -- ${LLVM_MAJOR}
           sudo apt-get install -y --no-install-recommends \
             llvm-${LLVM_MAJOR}-dev clang-${LLVM_MAJOR} \
-            libgmp-dev libmpfr-dev libreadline-dev \
+            libgmp-dev libmpfr-dev libreadline-dev libgsl-dev libblas-dev \
             autoconf automake libtool bison flex pkg-config gcc make zip
 
       # Cache the libpure install by its branch commit, so the ~2-minute build
@@ -87,9 +87,9 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pure
-          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-gsl1
 
-      - name: Build libpure from the fork
+      - name: Build libpure (and the gsl module) from the fork
         if: steps.purecache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch "${PURE_REF}" https://github.com/gburd/pure-lang.git
@@ -101,6 +101,11 @@ jobs:
             CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}"
           make -j"$(nproc)"
           make install
+          # Build the add-on Pure modules the test suite uses (gsl::matrix).
+          cd ../pure-gsl
+          PATH="$HOME/pure/bin:$PATH" PKG_CONFIG_PATH="$HOME/pure/lib/pkgconfig" \
+            make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" prefix="$HOME/pure"
+          PATH="$HOME/pure/bin:$PATH" make install prefix="$HOME/pure"
 
       - name: Install PostgreSQL ${{ matrix.pg }} WITHOUT the JIT package
         run: |
