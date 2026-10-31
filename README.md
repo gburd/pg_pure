@@ -94,6 +94,25 @@ SELECT * FROM primes(10);   -- 2 3 5 7 11 13 17 19 23 29
 ```
 *(Set-returning functions are on the roadmap, not in 0.1; see Status.)*
 
+Numeric arrays: `float8[]` maps to a Pure double matrix, so vector and matrix
+math works both directions. A 1-D array is a row vector, a 2-D array an n-by-m
+matrix:
+
+```sql
+CREATE FUNCTION vscale(v float8[], k float8) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ map (*k) v $$;
+SELECT vscale(ARRAY[1,2,3]::float8[], 10.0);      -- {10,20,30}
+
+CREATE FUNCTION mtransp(m float8[]) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ using gsl::matrix; transpose m $$;
+SELECT mtransp(ARRAY[[1,2,3],[4,5,6]]::float8[]);  -- {{1,4},{2,5},{3,6}}
+```
+
+For a dense linear solve, a compiled routine is the right tool: a pure-Pure
+Cholesky is correct but slow, so prefer `gsl::linalg::cholesky_solve` once that
+pure-gsl binding is available (proposed upstream). See the pg.ddx.io
+evaluation notes for the measured trade-off.
+
 Reaching the database with SPI, catching a SQL error by its SQLSTATE:
 
 ```sql

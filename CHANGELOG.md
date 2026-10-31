@@ -4,6 +4,27 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.3.0] - 2026-10-30
+
+### Added
+- **`float8[]` arrays map to and from Pure double matrices**, in both
+  languages. A 1-D `float8[]` becomes a 1-by-n Pure matrix (row vector); a
+  2-D `float8[][]` becomes an n-by-m matrix; the same shapes convert back on
+  return. A function can now take and return `float8[]`, so numeric kernels
+  (a Cholesky SPD solve, vector/matrix ops) run in Pure. Arrays containing
+  SQL NULL, and arrays with more than two dimensions, are rejected with a
+  clear error (a Pure double matrix is a dense rectangle of doubles).
+- The development build now installs the add-on Pure modules alongside
+  libpure, so `using gsl`, `using gsl::matrix`, etc. work in a function body
+  (untrusted) or when allow-listed via `pg_pure.using` (trusted).
+
+### Notes
+- A Cholesky/SPD solve written in pure Pure (over Pure lists) is correct but
+  not fast (~832 ms at K=18 vs ~23 ms in PL/pgSQL): Pure lists give O(n)
+  index/append. For a competitive solve use a compiled routine; a
+  `gsl::linalg::cholesky_solve` binding (proposed to pure-gsl,
+  gburd/pure-lang#1) runs K=18 in 0.02 ms.
+
 ## [0.2.0] - 2026-10-29
 
 ### Added

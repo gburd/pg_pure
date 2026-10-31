@@ -34,8 +34,12 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
       `sql/pg_pureu.sql`; all pass on PG 17, 18 and 19.
 - [x] 1.3 Type mapping: scalars, exact numeric (bigint and rational, with a
       verified round-trip), range checks, text-only text results, NULL,
-      numeric via math. Still to do: arrays as lists, composites as records,
-      other types through text I/O, a UTF-8 conversion for other encodings.
+      numeric via math, and **float8[] <-> Pure double matrix** (0.3: 1-D
+      vectors and 2-D matrices both directions; NULL-element arrays and
+      >2-D rejected; `using gsl::matrix` etc. work because the add-on Pure
+      modules are now built and installed alongside libpure). Still to do:
+      composites as records, other types through text I/O, a UTF-8
+      conversion for other encodings.
 - [x] 1.4 The `sql` namespace: `query`, `exec`, `notice`, `warning`,
       `null`, `error` carrying SQLSTATE. (Parameters to `query`/`exec` are
       designed but not yet implemented; the body still builds its own SQL
@@ -46,10 +50,9 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
 - [x] 1.9 Cross-platform: Linux (Debian 13) PG 17/18/19 and FreeBSD 14.5
       PG 17 both build against the fork's libpure and pass the suite with 0
       crashes. Windows ruled out with reasons (DESIGN.md section 10).
-- [ ] 1.4a Parameterized `sql::query (q, p1, ...)` / `sql::exec` (send
-      parameters, never splice).
-- [ ] 1.5 Set-returning functions (lists and lazy streams into a
-      tuplestore), triggers (`new`, `old`, `tg`), procedures.
+- [ ] 1.4a Parameterized SPI -> now phase 2.C (see below).
+- [ ] 1.5 Set-returning functions -> now phase 2.D; triggers and procedures
+      remain in phase 2b.
 - [ ] 1.6 Preloading: the `_PG_init` warm-up code exists but is not yet
       tested end to end; confirm backends inherit it and measure.
 - [ ] 1.7 TAP tests: crash safety (JIT plus Pure in both orders, with and
@@ -65,7 +68,32 @@ Gate: `ci/gate.sh` passes installcheck and TAP on PG 17 and PG 18, plus
 the cassert leg; the server log has 0 "terminated by signal" lines and 0
 TRAP lines; `make check-ascii` passes.
 
-## Phase 2: depth
+## Phase 2: adoption blockers from the pg.ddx.io evaluation
+
+Ordered by feasibility (easiest first). The pg.ddx.io team's 2026-10-29
+evaluation listed these as "what would change the answer"; arrays (1.3) and
+gsl (now built + a Cholesky PR to pure-gsl) are done, leaving these four.
+
+- [ ] 2.A **Nix package for libpure + add-on modules.** Packaging only, no
+      pg_pure code. A flake/derivation that builds libpure from the fork
+      (LLVM 21, GMP/MPFR) and the vetted modules (gsl, ...), so a host like
+      pg.ddx.io does not maintain a bespoke LLVM build. Easiest and
+      self-contained. Feasibility: high.
+- [ ] 2.B **TAP suite** (crash matrix JIT+Pure both orders reading the log;
+      cancel / `pg_terminate_backend`; 8 concurrent backends; RSS flat over
+      1M calls). Test harness only, no new runtime code; the crash-matrix
+      and RSS scripts already exist in `_/`. This is also ROADMAP 1.7 and
+      0.2. Feasibility: high, mechanical.
+- [ ] 2.C **Parameterized SPI** `sql::query (q, p1, ...)` / `sql::exec`
+      (send parameters as Datums via SPI_execute_with_args; never splice).
+      Real C, but the Pure->Datum conversion already exists. Feasibility:
+      medium.
+- [ ] 2.D **Set-returning functions** (a Pure list or lazy stream into a
+      tuplestore, forced element by element so an infinite stream is bounded
+      by the row limit / cancel). Hardest: tuplestore + materialize mode +
+      lazy forcing + per-row type conversion. Feasibility: medium-hard.
+
+## Phase 2b: depth
 
 - [ ] 2.1 Prepared plans, either cached per query string or as an explicit
       `sql::prepare`.
@@ -132,3 +160,12 @@ for untrusted multi-tenant workloads.
   symbols hidden (no coexistence workaround needed) and a safe mode. pg_pure
   0.2.0 wires the trusted `pg_pure` to the safe mode; both languages now run
   and pass on PG 17/18/19 with `jit=on`.
+- 2026-10-30: pg_pure 0.3.0 adds `float8[]` <-> Pure double-matrix support
+  (both languages) and the dev build installs the add-on Pure modules, so
+  `using gsl::matrix` works. From the pg.ddx.io evaluation: arrays unblock
+  writing their `commit_model_solve`, but a pure-Pure Cholesky over Pure
+  lists is ~832 ms at K=18 vs ~23 ms PL/pgSQL -- not competitive. The unlock
+  is a compiled binding: `gsl::linalg::cholesky_solve` (PR to the fork,
+  gburd/pure-lang#1) runs K=18 in 0.02 ms. Remaining pg.ddx.io asks are
+  phase 2.A-2.D, ordered by feasibility. Dev work now on the `chef` burner
+  account (kiwi expired).

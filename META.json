@@ -2,7 +2,7 @@
    "name": "pg_pure",
    "abstract": "Write PostgreSQL functions in the Pure programming language",
    "description": "pg_pure embeds libpure to make Pure a procedural language in PostgreSQL, like PL/Perl or PL/Python. A function body is Pure code: term rewriting with pattern matching, exact rational and arbitrary-precision arithmetic, lazy streams, and symbolic computation, with database access through SPI. It provides a trusted language (pg_pure, pending a libpure sandbox) and an untrusted, superuser-only language (pg_pureu).",
-   "version": "0.2.0",
+   "version": "0.3.0",
    "maintainer": [
       "Gregory Burd <greg@burd.me>"
    ],
@@ -12,13 +12,13 @@
          "abstract": "Trusted PL/Pure procedural language",
          "file": "pg_pure--0.1.sql",
          "docfile": "README.md",
-         "version": "0.2.0"
+         "version": "0.3.0"
       },
       "pg_pureu": {
          "abstract": "Untrusted (superuser-only) PL/Pure procedural language",
          "file": "pg_pureu--0.1.sql",
          "docfile": "README.md",
-         "version": "0.2.0"
+         "version": "0.3.0"
       }
    },
    "prereqs": {

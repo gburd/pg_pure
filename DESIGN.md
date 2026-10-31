@@ -115,8 +115,8 @@ validator rejects such names.
 | float4, float8 | double | double, int, bigint, rational |
 | bool | 1 or 0 (Pure's `true` and `false`) | int; nonzero is true |
 | text, varchar, char, name | string, converted to UTF-8 | strings only |
-| arrays | lists (nested lists for multi-dimensional arrays) | list or matrix |
-| composite types, record | record `{"col"=>value, ...}` | record, or tuple in column order |
+| float8[] | a Pure double matrix (1-D -> 1-by-n row vector, 2-D -> n-by-m); no NULL elements, <=2 dims (implemented, 0.3) | a double matrix back to float8[] (1-row -> 1-D, else 2-D) |
+| other arrays, composite types, record | planned: lists / record `{"col"=>value}` (not yet) | planned |
 | NULL | `sql::null` | `sql::null` |
 | any other type | its text form, as a string | a string, passed to the type's input function |
 

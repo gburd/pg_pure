@@ -47,6 +47,7 @@
 #include "miscadmin.h"
 #include "nodes/miscnodes.h"
 #include "storage/ipc.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -337,6 +338,7 @@ type_supported(Oid t)
 		case TEXTOID:
 		case VARCHAROID:
 		case NUMERICOID:
+		case FLOAT8ARRAYOID:
 			return true;
 		default:
 			return false;
@@ -399,6 +401,71 @@ numeric_to_pure(Datum d)
 	return x;
 }
 
+/*
+ * float8[] -> Pure double matrix. A 1-D SQL array of n elements becomes a
+ * 1-by-n Pure matrix (a row vector); a 2-D n-by-m array becomes an n-by-m
+ * matrix. Higher dimensions and arrays containing NULL are rejected: a Pure
+ * double matrix is a dense rectangle of doubles with no null slot. The SQL
+ * array's own element order is row-major, which is what matrix_from_double_array
+ * expects.
+ */
+static pure_expr *
+float8array_to_pure(Datum d)
+{
+	ArrayType  *a = DatumGetArrayTypeP(d);
+	int			ndim = ARR_NDIM(a);
+	int		   *dims = ARR_DIMS(a);
+	uint32_t	n,
+				m;
+	Datum	   *elems;
+	bool	   *nulls;
+	int			nelems;
+	double	   *buf;
+	pure_expr  *x;
+
+	if (ARR_ELEMTYPE(a) != FLOAT8OID)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_pure: only float8[] arrays are supported")));
+	if (ndim == 0)
+		return matrix_from_double_array(0, 0, NULL);	/* empty matrix */
+	if (ndim > 2)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("pg_pure: float8[] with more than 2 dimensions is not supported")));
+
+	deconstruct_array(a, FLOAT8OID, sizeof(float8), FLOAT8PASSBYVAL, 'd',
+					  &elems, &nulls, &nelems);
+	for (int i = 0; i < nelems; i++)
+		if (nulls[i])
+			ereport(ERROR,
+					(errcode(ERRCODE_NULL_VALUE_NOT_ALLOWED),
+					 errmsg("pg_pure: a float8[] passed to Pure must not contain NULL elements")));
+
+	if (ndim == 1)
+	{
+		n = 1;
+		m = (uint32_t) dims[0];
+	}
+	else
+	{
+		n = (uint32_t) dims[0];
+		m = (uint32_t) dims[1];
+	}
+	buf = palloc(sizeof(double) * (nelems ? nelems : 1));
+	for (int i = 0; i < nelems; i++)
+		buf[i] = DatumGetFloat8(elems[i]);
+	x = matrix_from_double_array(n, m, buf);	/* copies buf */
+	pfree(buf);
+	pfree(elems);
+	pfree(nulls);
+	if (!x)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("pg_pure: could not build a Pure matrix from the float8[]")));
+	return x;
+}
+
 static pure_expr *
 datum_to_pure(Datum d, bool isnull, Oid type)
 {
@@ -420,6 +487,8 @@ datum_to_pure(Datum d, bool isnull, Oid type)
 			return pure_int(DatumGetBool(d) ? 1 : 0);
 		case NUMERICOID:
 			return numeric_to_pure(d);
+		case FLOAT8ARRAYOID:
+			return float8array_to_pure(d);
 		default:
 			{
 				/* text, varchar, and (via SPI) any other type: its text form */
@@ -661,6 +730,68 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 				return true;
 			}
 			return false;
+		case FLOAT8ARRAYOID:
+			{
+				/*
+				 * A Pure double matrix becomes a float8[]: a 1-row matrix a
+				 * 1-D array, any other shape a 2-D n-by-m array (row-major,
+				 * which matrix_to_double_array produces). Anything that is not
+				 * a double matrix (a symbolic or int matrix, a scalar, an
+				 * unmatched application) is a type mismatch.
+				 */
+				void	   *mp;
+				pure_expr  *dimx;
+				int32_t		nrows,
+							ncols;
+				uint32_t	 sz;
+				double	   *buf;
+				Datum	   *elems;
+				ArrayType  *arr;
+
+				if (!pure_is_double_matrix(x, &mp))
+					return false;
+				/* matrix_dim returns the pair (rows, cols). */
+				dimx = matrix_dim(x);
+				if (!dimx)
+					return false;
+				{
+					size_t		ndims;
+					pure_expr **de;
+
+					if (!pure_is_tuplev(dimx, &ndims, &de) || ndims != 2 ||
+						!pure_is_int(de[0], &nrows) || !pure_is_int(de[1], &ncols))
+					{
+						if (ndims && de)
+							free(de);
+						pure_freenew(dimx);
+						return false;
+					}
+					free(de);
+					pure_freenew(dimx);
+				}
+				sz = matrix_size(x);
+				buf = palloc(sizeof(double) * (sz ? sz : 1));
+				matrix_to_double_array(buf, x);	/* respects stride */
+				elems = palloc(sizeof(Datum) * (sz ? sz : 1));
+				for (uint32_t i = 0; i < sz; i++)
+					elems[i] = Float8GetDatum(buf[i]);
+				if (nrows <= 1)
+					arr = construct_array(elems, (int) sz, FLOAT8OID,
+										  sizeof(float8), FLOAT8PASSBYVAL, 'd');
+				else
+				{
+					int			dims[2] = {nrows, ncols};
+					int			lbs[2] = {1, 1};
+
+					arr = construct_md_array(elems, NULL, 2, dims, lbs,
+											 FLOAT8OID, sizeof(float8),
+											 FLOAT8PASSBYVAL, 'd');
+				}
+				pfree(buf);
+				pfree(elems);
+				*d = PointerGetDatum(arr);
+				return true;
+			}
 	}
 	return false;
 }
