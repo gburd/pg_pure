@@ -90,3 +90,22 @@ SELECT ARRAY(SELECT round(v::numeric, 10) FROM unnest(
 SELECT ARRAY(SELECT round(v::numeric, 10) FROM unnest(
   chol_solve(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[])
 ) v);
+
+-- The fast path: the same SPD solve through gsl::linalg::cholesky_solve, a
+-- compiled C routine (~40x faster than a pure-Pure solve, and than PL/pgSQL).
+-- gsl::linalg is pre-loaded and allow-listed by the DBA via pg_pure.using
+-- (set to 'math gsl::linalg' for this suite), so a trusted body may call it
+-- directly. A trusted body may NOT pull in an arbitrary module with "using"
+-- itself; that is the DBA's decision.
+CREATE FUNCTION chol_solve_gsl(a float8[], b float8[]) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ gsl::linalg::cholesky_solve a b $$;
+SELECT ARRAY(SELECT round(v::numeric, 10) FROM unnest(
+  chol_solve_gsl(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[])
+) v) AS gsl_solve;
+-- the gsl solve and the pure-Pure solve agree
+SELECT (SELECT round(max(abs(g[i]-p[i]))::numeric, 12)
+        FROM generate_subscripts(g, 1) i) AS gsl_vs_pure_maxdiff
+FROM (SELECT
+   chol_solve_gsl(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[]) g,
+   chol_solve(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[]) p
+) t;

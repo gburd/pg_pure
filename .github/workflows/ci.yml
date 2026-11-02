@@ -136,6 +136,10 @@ jobs:
             echo "unix_socket_directories='/tmp'"
             echo "port=5999"
             echo "jit=on"
+            # Pre-load and allow-list the modules the suite uses in the trusted
+            # language (gsl::linalg for the Cholesky solve). A trusted body
+            # cannot "using" an arbitrary module; the DBA approves them here.
+            echo "pg_pure.using='math gsl::linalg'"
           } >> "$D/postgresql.conf"
           PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
           set +e

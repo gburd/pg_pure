@@ -113,7 +113,7 @@ jobs:
           make check-ascii
           sudo make install PG_CONFIG=$PGBIN/pg_config PURE_PREFIX="$HOME/pure"
           D="$RUNNER_TEMP/pgdata"; $PGBIN/initdb -A trust -U postgres -D "$D"
-          printf "listen_addresses=''\nunix_socket_directories='/tmp'\nport=5999\n" >> "$D/postgresql.conf"
+          printf "listen_addresses=''\nunix_socket_directories='/tmp'\nport=5999\npg_pure.using='math gsl::linalg'\n" >> "$D/postgresql.conf"
           PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
           make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres
           $PGBIN/pg_ctl -D "$D" -m fast stop

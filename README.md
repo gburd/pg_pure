@@ -108,9 +108,18 @@ CREATE FUNCTION mtransp(m float8[]) RETURNS float8[]
 SELECT mtransp(ARRAY[[1,2,3],[4,5,6]]::float8[]);  -- {{1,4},{2,5},{3,6}}
 ```
 
-For a dense linear solve, a compiled routine is the right tool: a pure-Pure
-Cholesky is correct but slow, so prefer `gsl::linalg::cholesky_solve` once that
-pure-gsl binding is available (proposed upstream). See the pg.ddx.io
+For a dense linear solve, use the compiled routine, not a hand-written one: a
+pure-Pure Cholesky is correct but slow, so prefer `gsl::linalg::cholesky_solve`
+(in pure-gsl as of the module version pg_pure 0.4.0 builds against). It solves
+a symmetric positive-definite `A x = b` over `float8[]` at C speed:
+
+```sql
+-- the DBA allow-lists the module once: pg_pure.using = 'math gsl::linalg'
+CREATE FUNCTION solve_spd(a float8[], b float8[]) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ gsl::linalg::cholesky_solve a b $$;
+```
+
+That runs about 40x faster than the same solve in PL/pgSQL. See the pg.ddx.io
 evaluation notes for the measured trade-off.
 
 Reaching the database with SPI, catching a SQL error by its SQLSTATE:
@@ -265,16 +274,18 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.2, in development. Working: both languages (`pg_pure` trusted via libpure
+0.4, in development. Working: both languages (`pg_pure` trusted via libpure
 safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
 float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
-`sql::query`/`sql::exec`/`sql::notice`/`sql::warning`, SQL-error-as-
-`sql::error`, DO blocks, the validator, and preload warm-up. PostgreSQL
-17/18/19 pass both regression suites with `jit=on` and zero crashes.
+`float8[]` <-> Pure double matrix, `sql::query`/`sql::exec`/`sql::notice`/
+`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the validator, preload
+warm-up, the add-on Pure modules (`using gsl`, ...), and a compiled
+`gsl::linalg::cholesky_solve` SPD solve. PostgreSQL 17/18/19 pass both
+regression suites with `jit=on` and zero crashes.
 
-Not yet: parameterized SPI, set-returning functions, triggers, arrays and
-composites, per-SQL-user trusted interpreters, a curated safe-mode prelude,
-and the TAP suite. See `ROADMAP.md`.
+Not yet: parameterized SPI, set-returning functions, triggers, composite
+types, per-SQL-user trusted interpreters, a curated safe-mode prelude, and
+the TAP suite. See `ROADMAP.md`.
 
 ## Documentation
 

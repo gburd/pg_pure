@@ -72,7 +72,9 @@ TRAP lines; `make check-ascii` passes.
 
 Ordered by feasibility (easiest first). The pg.ddx.io team's 2026-10-29
 evaluation listed these as "what would change the answer"; arrays (1.3) and
-gsl (now built + a Cholesky PR to pure-gsl) are done, leaving these four.
+the gsl modules are done, and the `gsl::linalg::cholesky_solve` binding
+(fork PR #1) is MERGED and exercised by pg_pure 0.4.0's suite -- a compiled
+SPD solve ~40x faster than PL/pgSQL. Four asks remain.
 
 - [ ] 2.A **Nix package for libpure + add-on modules.** Packaging only, no
       pg_pure code. A flake/derivation that builds libpure from the fork

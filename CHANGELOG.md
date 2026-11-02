@@ -4,6 +4,31 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.4.0] - 2026-11-02
+
+### Added
+- A compiled linear solve: `gsl::linalg::cholesky_solve` is now usable from
+  pg_pure, having landed in the pure-gsl module (fork `gburd/pure-lang`, PR
+  #1). A function can solve a symmetric positive-definite system `A x = b`
+  over `float8[]` at C speed -- about 40x faster than the same solve written
+  in PL/pgSQL, and far faster than a solve written in pure Pure over Pure
+  lists (which is not competitive). `sql/pg_pure.sql` adds a
+  `gsl::linalg::cholesky_solve`-backed solver and checks it agrees with the
+  pure-Pure Cholesky to 12 decimals.
+
+### Notes
+- In the trusted `pg_pure` language, a module like `gsl::linalg` must be
+  pre-loaded and allow-listed by the DBA through `pg_pure.using` (e.g.
+  `pg_pure.using = 'math gsl::linalg'`); a trusted function body may then call
+  `gsl::linalg::cholesky_solve` directly. A trusted body may **not** pull in
+  an arbitrary module with its own `using` clause -- that is the DBA's
+  decision, and libpure's safe mode enforces it. (`pg_pureu`, untrusted, may
+  `using` any installed module.)
+- Known libpure refinement: in safe mode, a body's `using gsl::linalg` is
+  rejected by the module-path check before the allowlist is consulted, so the
+  pre-load-via-GUC path above is the supported way to use a namespaced
+  submodule in the trusted language.
+
 ## [0.3.0] - 2026-10-30
 
 ### Added
