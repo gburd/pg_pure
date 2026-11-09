@@ -106,6 +106,37 @@ CREATE FUNCTION prows() RETURNS text LANGUAGE pg_pureu AS
   'str (sql::query "SELECT k, v FROM t ORDER BY k")';
 SELECT prows();
 
+-- Parameterized SPI: values are sent to the planner as Datums via
+-- SPI_execute_with_args, never spliced into the SQL text. The call shape is
+-- sql::query (q, [p1, p2, ...]) and sql::exec (q, [...]).
+CREATE FUNCTION pparam(lo int) RETURNS int LANGUAGE pg_pureu AS
+  'foldl (+) 0 (sql::query ("SELECT k FROM t WHERE k >= $1", [lo]))';
+SELECT pparam(2);                       -- 2 + 3 = 5
+CREATE FUNCTION pfind(name text) RETURNS text LANGUAGE pg_pureu AS
+  'str (sql::query ("SELECT k FROM t WHERE v = $1", [name]))';
+SELECT pfind('two');                    -- [2]
+-- a double parameter
+CREATE FUNCTION pdbl(x float8) RETURNS text LANGUAGE pg_pureu AS
+  'str (sql::query ("SELECT ($1::float8) * 2", [x]))';
+SELECT pdbl(1.5);                        -- [3.0]
+-- sql::null as a parameter is a SQL NULL, not the text "null"
+CREATE FUNCTION pnullp() RETURNS text LANGUAGE pg_pureu AS
+  'str (sql::query ("SELECT $1 IS NULL", [sql::null]))';
+SELECT pnullp();                        -- [1] (true)
+-- a value full of SQL metacharacters is just data, never parsed as SQL
+CREATE FUNCTION pinject() RETURNS int LANGUAGE pg_pureu AS
+  'sql::exec ("INSERT INTO t VALUES (99, $1)", ["); DROP TABLE t; --"])';
+SELECT pinject();                       -- 1 row inserted; table t survives
+SELECT count(*) FROM t;                  -- 4 (table intact)
+SELECT v FROM t WHERE k = 99;            -- the literal metacharacter string
+DELETE FROM t WHERE k = 99;
+-- parameterized exec returns the affected row count
+CREATE FUNCTION pupd(nv text, kk int) RETURNS int LANGUAGE pg_pureu AS
+  'sql::exec ("UPDATE t SET v = $1 WHERE k = $2", [nv, kk])';
+SELECT pupd('ONE', 1);                   -- 1
+SELECT v FROM t WHERE k = 1;             -- ONE
+UPDATE t SET v = 'one' WHERE k = 1;
+
 -- an SQL error inside SPI reaches the client as that SQL error
 CREATE FUNCTION pbadsql() RETURNS int LANGUAGE pg_pureu AS
   'sql::exec "SELECT * FROM no_such_table"';

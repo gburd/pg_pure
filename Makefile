@@ -22,6 +22,11 @@ DATA = pg_pure--0.1.sql pg_pureu--0.1.sql
 
 REGRESS = pg_pureu pg_pure
 
+# The TAP suite (t/*.pl): the JIT+Pure crash matrix, cancel/terminate,
+# concurrency and bounded-memory checks. Run by `make installcheck` when the
+# PostgreSQL::Test perl harness and IPC::Run are available, and by ci/gate.sh.
+TAP_TESTS = 1
+
 PG_CPPFLAGS = -I$(PURE_PREFIX)/include
 SHLIB_LINK = -L$(PURE_PREFIX)/lib -Wl,-rpath,$(PURE_PREFIX)/lib -lpure
 

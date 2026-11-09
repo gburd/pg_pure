@@ -4,6 +4,39 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.5.0] - 2026-11-09
+
+### Added
+- **Parameterized SPI.** `sql::query` and `sql::exec` now take an optional
+  parameter list: `sql::query (q, [p1, p2, ...])` and
+  `sql::exec (q, [...])`. The values are passed to the planner as Datums via
+  `SPI_execute_with_args` -- never spliced into the SQL text -- so a value
+  full of SQL metacharacters is just data, not an injection. The SQL type is
+  inferred from each Pure value (int -> int8, double -> float8, string ->
+  text, bigint -> numeric, `sql::null` -> a SQL NULL); anything else is a
+  clear type error. Works in the trusted language's armed interpreter too.
+  The no-parameter forms (`sql::query q`, `sql::exec q`) are unchanged.
+- **A Nix package** (`nix/flake.nix`) that builds libpure from the fork
+  (LLVM 21, GMP/MPFR) and the pure-gsl modules, exposing `libpure`,
+  `pure-gsl`, `pure-with-modules` and a devShell. A host can point
+  `PURE_PREFIX` at the result instead of maintaining a bespoke LLVM build.
+  `nix flake check` passes. See `nix/README.md`.
+- **A TAP suite** (`t/001_crash_matrix.pl`, `t/002_robustness.pl`): the
+  PostgreSQL-JIT-and-Pure crash matrix in both orders (read from the server
+  log, on a JIT-enabled PostgreSQL 17/18/19, 0 crashes); cancel via
+  `statement_timeout` and `pg_terminate_backend`; eight concurrent backends;
+  and a backend's resident memory plateauing over millions of calls (the
+  fourth 1,000,000-call batch adds about 0 MB, so there is no per-call leak).
+  `ci/gate.sh` runs the regression and TAP suites together; CI runs the TAP
+  suite as its own step.
+
+### Notes
+- This release adds no new type conversions and no change to the trust model;
+  it is additive. It closes three of the four remaining items from the
+  pg.ddx.io evaluation (parameterized SPI, the qualification TAP suite, and
+  the libpure Nix package). Set-returning functions remain for a later,
+  focused release.
+
 ## [0.4.0] - 2026-11-02
 
 ### Added

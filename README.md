@@ -122,16 +122,21 @@ CREATE FUNCTION solve_spd(a float8[], b float8[]) RETURNS float8[]
 That runs about 40x faster than the same solve in PL/pgSQL. See the pg.ddx.io
 evaluation notes for the measured trade-off.
 
-Reaching the database with SPI, catching a SQL error by its SQLSTATE:
+Reaching the database with SPI, with a parameter passed as data (never
+spliced), and catching a SQL error by its SQLSTATE:
 
 ```sql
 CREATE FUNCTION add_user(email text) RETURNS bool LANGUAGE pg_pureu AS $$
-  catch dup (sql::exec ("INSERT INTO users(email) VALUES ($1)", email) > 0)
+  catch dup (sql::exec ("INSERT INTO users(email) VALUES ($1)", [email]) > 0)
   with dup (sql::error "23505" _) = false; dup e = throw e end
 $$;
 ```
-*(Parameterized `sql::query`/`sql::exec` are on the roadmap; 0.1 builds the SQL
-string in Pure.)*
+
+Parameters go to the planner as Datums via `SPI_execute_with_args`: the call
+shape is `sql::query (q, [p1, p2, ...])` and `sql::exec (q, [...])`, and a
+parameter's SQL type is inferred from the Pure value (int, double, string,
+bigint, or `sql::null`). The no-parameter forms `sql::query q` and
+`sql::exec q` still work.
 
 ## Requirements
 
@@ -274,16 +279,18 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.4, in development. Working: both languages (`pg_pure` trusted via libpure
+0.5, in development. Working: both languages (`pg_pure` trusted via libpure
 safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
 float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
-`float8[]` <-> Pure double matrix, `sql::query`/`sql::exec`/`sql::notice`/
-`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the validator, preload
-warm-up, the add-on Pure modules (`using gsl`, ...), and a compiled
-`gsl::linalg::cholesky_solve` SPD solve. PostgreSQL 17/18/19 pass both
-regression suites with `jit=on` and zero crashes.
+`float8[]` <-> Pure double matrix, `sql::query`/`sql::exec` (with parameters
+passed as Datums), `sql::notice`/`sql::warning`, SQL-error-as-`sql::error`,
+DO blocks, the validator, preload warm-up, the add-on Pure modules
+(`using gsl`, ...), and a compiled `gsl::linalg::cholesky_solve` SPD solve. A
+Nix package builds libpure and the modules; a TAP suite covers the JIT+Pure
+crash matrix, cancel, concurrency and bounded memory. PostgreSQL 17/18/19
+pass both regression suites with `jit=on` and zero crashes.
 
-Not yet: parameterized SPI, set-returning functions, triggers, composite
+Not yet: set-returning functions, triggers, composite
 types, per-SQL-user trusted interpreters, a curated safe-mode prelude, and
 the TAP suite. See `ROADMAP.md`.
 

@@ -114,6 +114,7 @@ static CachedFunc *func_cache = NULL;
 static ErrorData *pending_pg_error = NULL;
 
 static pure_expr *datum_to_pure(Datum d, bool isnull, Oid type);
+static bool pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow);
 static pure_interp *ensure_interp(bool trusted);
 
 /* --- cooperative cancel ------------------------------------------------ */
@@ -205,8 +206,53 @@ report_pure_failure(const char *lang, const char *what, pure_expr *exc)
  * failed query held (locks, pins, catalog cache references, memory) are
  * released with the subtransaction.
  */
+/*
+ * Convert one Pure value used as a query parameter into a Datum, inferring
+ * the SQL type from the Pure value's runtime shape. Supported: sql::null
+ * (a SQL NULL), machine int (INT8), double (FLOAT8), string (TEXT), and
+ * bigint (NUMERIC). Anything else is a type mismatch. The value is sent to
+ * SPI as a Datum, never spliced into the SQL text, so it cannot be an
+ * injection vector.
+ */
+static void
+pure_param_to_datum(pure_expr *x, Oid *type, Datum *value, char *nul)
+{
+	int32_t		sym;
+	bool		overflow;
+	bool		isnull;
+	const char *s;
+	double		f;
+
+	if (pure_is_symbol(x, &sym) && sym == sym_sql_null)
+	{
+		*type = TEXTOID;
+		*value = (Datum) 0;
+		*nul = 'n';
+		return;
+	}
+	*nul = ' ';
+	if (pure_is_string(x, &s))
+		*type = TEXTOID;
+	else if (pure_is_double(x, &f))
+		*type = FLOAT8OID;
+	else if (pure_is_int(x, NULL))
+		*type = INT8OID;
+	else if (pure_is_mpz(x, NULL))
+		*type = NUMERICOID;
+	else
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("unsupported pg_pure query parameter"),
+				 errdetail("A parameter must be an int, a double, a string, a bigint, or sql::null.")));
+	if (!pure_to_datum(x, *type, value, &isnull, &overflow))
+		ereport(ERROR,
+				(errcode(overflow ? ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE
+						 : ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("pg_pure query parameter does not fit its inferred type")));
+}
+
 static pure_expr *
-spi_run(const char *sql, bool want_rows)
+spi_run(const char *sql, bool want_rows, pure_expr *params)
 {
 	pure_expr  *volatile result = NULL;
 	MemoryContext oldcxt = CurrentMemoryContext;
@@ -218,7 +264,29 @@ spi_run(const char *sql, bool want_rows)
 	MemoryContextSwitchTo(oldcxt);
 	PG_TRY();
 	{
-		int			rc = SPI_execute(sql, false, 0);
+		int			rc;
+		size_t		np = 0;
+		pure_expr **pe = NULL;
+
+		if (params && !pure_is_listv(params, &np, &pe))
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("pg_pure query parameters must be a list")));
+		if (np == 0)
+			rc = SPI_execute(sql, false, 0);
+		else
+		{
+			Oid		   *argtypes = palloc(sizeof(Oid) * np);
+			Datum	   *values = palloc(sizeof(Datum) * np);
+			char	   *nulls = palloc(np);
+
+			for (size_t i = 0; i < np; i++)
+				pure_param_to_datum(pe[i], &argtypes[i], &values[i], &nulls[i]);
+			rc = SPI_execute_with_args(sql, (int) np, argtypes, values,
+									   nulls, false, 0);
+		}
+		if (pe)
+			free(pe);
 
 		if (rc < 0)
 			elog(ERROR, "SPI_execute failed: %s", SPI_result_code_string(rc));
@@ -295,19 +363,33 @@ spi_run(const char *sql, bool want_rows)
 
 PGDLLEXPORT pure_expr *pg_pure_spi_query(const char *sql);
 PGDLLEXPORT pure_expr *pg_pure_spi_exec(const char *sql);
+PGDLLEXPORT pure_expr *pg_pure_spi_query_p(const char *sql, pure_expr *params);
+PGDLLEXPORT pure_expr *pg_pure_spi_exec_p(const char *sql, pure_expr *params);
 PGDLLEXPORT void pg_pure_notice(const char *msg);
 PGDLLEXPORT void pg_pure_warning(const char *msg);
 
 pure_expr *
 pg_pure_spi_query(const char *sql)
 {
-	return spi_run(sql, true);
+	return spi_run(sql, true, NULL);
 }
 
 pure_expr *
 pg_pure_spi_exec(const char *sql)
 {
-	return spi_run(sql, false);
+	return spi_run(sql, false, NULL);
+}
+
+pure_expr *
+pg_pure_spi_query_p(const char *sql, pure_expr *params)
+{
+	return spi_run(sql, true, params);
+}
+
+pure_expr *
+pg_pure_spi_exec_p(const char *sql, pure_expr *params)
+{
+	return spi_run(sql, false, params);
 }
 
 void
@@ -837,8 +919,14 @@ ensure_interp(bool trusted)
 						   "namespace sql;\n"
 						   "nonfix null;\n"
 						   "public error query exec;\n"
-						   "extern expr* pg_pure_spi_query(char*) = query;\n"
-						   "extern expr* pg_pure_spi_exec(char*) = exec;\n"
+						   "extern expr* pg_pure_spi_query(char*) = query_;\n"
+						   "extern expr* pg_pure_spi_exec(char*) = exec_;\n"
+						   "extern expr* pg_pure_spi_query_p(char*, expr*) = query_p;\n"
+						   "extern expr* pg_pure_spi_exec_p(char*, expr*) = exec_p;\n"
+						   "query (q::string, ps::list) = query_p q ps;\n"
+						   "query q::string = query_ q;\n"
+						   "exec (q::string, ps::list) = exec_p q ps;\n"
+						   "exec q::string = exec_ q;\n"
 						   "extern void pg_pure_notice(char*) = notice;\n"
 						   "extern void pg_pure_warning(char*) = warning;\n"
 						   "namespace;\n");

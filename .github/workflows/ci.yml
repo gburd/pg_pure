@@ -143,7 +143,7 @@ jobs:
           } >> "$D/postgresql.conf"
           PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
           set +e
-          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres
+          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres PROVE_TESTS=ci/noop.pl
           rc=$?
           set -e
           $PGBIN/pg_ctl -D "$D" -m fast stop || true
@@ -154,3 +154,16 @@ jobs:
             echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true
             exit $rc
           fi
+
+      - name: TAP suite (crash matrix, cancel, concurrency, memory)
+        run: |
+          sudo apt-get install -y libipc-run-perl
+          PGBIN=/usr/lib/postgresql/${{ matrix.pg }}/bin
+          PGXS=$($PGBIN/pg_config --pkglibdir)/pgxs
+          find tmp_check -mindepth 1 -delete 2>/dev/null || true; rmdir tmp_check 2>/dev/null || true
+          PERL5LIB="$PGXS/src/test/perl" \
+            PATH="$PGBIN:$PATH" \
+            PG_REGRESS="$PGXS/src/test/regress/pg_regress" \
+            PURELIB="$HOME/pure/lib/pure" \
+            LD_LIBRARY_PATH="$HOME/pure/lib" \
+            prove t/*.pl

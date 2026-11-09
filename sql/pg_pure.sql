@@ -22,6 +22,12 @@ CREATE FUNCTION tsum() RETURNS int LANGUAGE pg_pure AS
   'foldl (+) 0 (sql::query "SELECT k FROM tt")';
 SELECT tsum();
 
+-- Parameterized SPI works in the armed trusted interpreter too (values go as
+-- Datums, never spliced): sum of tt rows at or above a bound.
+CREATE FUNCTION tparam(lo int) RETURNS int LANGUAGE pg_pure AS
+  'foldl (+) 0 (sql::query ("SELECT k FROM tt WHERE k >= $1", [lo]))';
+SELECT tparam(20);                       -- 20 + 30 = 50
+
 -- NULL and the sql namespace behave as in pg_pureu
 CREATE FUNCTION tnull(x int) RETURNS int LANGUAGE pg_pure AS
   'case x of sql::null = -1; _ = x end';
