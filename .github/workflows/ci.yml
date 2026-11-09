@@ -87,7 +87,11 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pure
-          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-gsl1
+          # The pure-gsl module dlopens the runner's libgsl, so a cached build
+          # from an older runner image can bind to a libgsl that is no longer
+          # present (the gsl extern then fails to reduce). Bump the trailing
+          # counter whenever the runner image's GSL/BLAS changes.
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-gsl2
 
       - name: Build libpure (and the gsl module) from the fork
         if: steps.purecache.outputs.cache-hit != 'true'

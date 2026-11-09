@@ -90,7 +90,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pure
-          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-gsl1
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-gsl2
 
       - name: Build libpure (and the gsl module) from the fork
         if: steps.purecache.outputs.cache-hit != 'true'
@@ -115,8 +115,10 @@ jobs:
           D="$RUNNER_TEMP/pgdata"; $PGBIN/initdb -A trust -U postgres -D "$D"
           printf "listen_addresses=''\nunix_socket_directories='/tmp'\nport=5999\npg_pure.using='math gsl::linalg'\n" >> "$D/postgresql.conf"
           PURELIB="$HOME/pure/lib/pure" $PGBIN/pg_ctl -D "$D" -l "$D/log" -w start
-          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres PROVE_TESTS=ci/noop.pl
+          rc=0
+          make installcheck PG_CONFIG=$PGBIN/pg_config PGHOST=/tmp PGPORT=5999 PGUSER=postgres PROVE_TESTS=ci/noop.pl || rc=$?
           $PGBIN/pg_ctl -D "$D" -m fast stop
+          if [ "$rc" -ne 0 ]; then echo "=== regression.diffs ==="; cat regression.diffs 2>/dev/null || true; exit "$rc"; fi
 
       - name: Build source distribution (PGXN zip)
         id: dist
