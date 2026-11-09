@@ -20,6 +20,11 @@ $node->safe_psql('postgres',
 # A long-running Pure loop: count down from a big number (pure, no SPI).
 $node->safe_psql('postgres',
 	q{CREATE FUNCTION pspin(n int) RETURNS int LANGUAGE pg_pureu AS 'loop n with loop 0 = 0; loop k = loop (k-1) end'});
+# A set-returning function over an infinite lazy stream: used to show that a
+# cancel stops it and that the row cap bounds it (materialize mode fills the
+# whole set before LIMIT, so an unbounded body must be stopped some other way).
+$node->safe_psql('postgres',
+	q{CREATE FUNCTION pinf() RETURNS SETOF int LANGUAGE pg_pureu AS 'iterate (+1) 1'});
 
 # --- 1. statement_timeout cancels a Pure call; the backend survives. -------
 my ($rc, $out, $err) = $node->psql(
@@ -43,6 +48,26 @@ $node->safe_psql('postgres',
 $bg->quit;
 is($node->safe_psql('postgres', 'SELECT pm(2,21)::text'),
 	'43', 'server survives pg_terminate_backend of a Pure call');
+
+# --- 2b. A set-returning function over an infinite stream is cancellable. --
+# Materialize mode collects rows before LIMIT, so SELECT pinf() LIMIT 4 would
+# fill forever; statement_timeout must still stop it (the per-row interrupt
+# check), and the server must survive.
+($rc, $out, $err) = $node->psql(
+	'postgres',
+	'SET statement_timeout = 500; SELECT pinf() LIMIT 4',
+	on_error_stop => 0);
+like($err, qr/canceling statement due to statement timeout/,
+	'an unbounded set-returning stream is cancelled by statement_timeout');
+is($node->safe_psql('postgres', 'SELECT pm(3,14)::text'),
+	'43', 'server survives cancelling a set-returning stream');
+# A body that bounds the stream itself returns normally.
+is( $node->safe_psql(
+		'postgres',
+		q{CREATE FUNCTION ptake(n int) RETURNS SETOF int LANGUAGE pg_pureu AS 'take n (iterate (+1) 1)';
+		  SELECT string_agg(x::text, ',') FROM ptake(4) AS x}),
+	'1,2,3,4',
+	'a lazy stream bounded in the body returns its rows');
 
 # --- 3. Eight concurrent backends each compile and call Pure. --------------
 my @bgs;

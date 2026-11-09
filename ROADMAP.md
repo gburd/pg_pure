@@ -51,8 +51,9 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
       PG 17 both build against the fork's libpure and pass the suite with 0
       crashes. Windows ruled out with reasons (DESIGN.md section 10).
 - [x] 1.4a Parameterized SPI -> done in phase 2.C (see below).
-- [ ] 1.5 Set-returning functions -> phase 2.D (deferred past 0.5.0, below);
-      triggers and procedures remain in phase 2b.
+- [x] 1.5 Set-returning functions -> done in phase 2.D (SETOF scalar/array;
+      RETURNS TABLE / SETOF composite remain in phase 2b). Triggers and
+      procedures remain in phase 2b.
 - [ ] 1.6 Preloading: the `_PG_init` warm-up code exists but is not yet
       tested end to end; confirm backends inherit it and measure.
 - [x] 1.7 TAP tests: crash safety (JIT plus Pure in both orders, checked in
@@ -93,14 +94,16 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
       `SPI_execute_with_args`, never spliced; type inferred from the Pure
       value (int->int8, double->float8, string->text, bigint->numeric,
       `sql::null`->NULL). Works in the armed trusted interpreter too.
-- [ ] 2.D **Set-returning functions** (a Pure list or lazy stream into a
-      tuplestore, forced element by element so an infinite stream is bounded
-      by the row limit / cancel). Hardest: tuplestore + materialize mode +
-      lazy forcing + per-row type conversion. Feasibility: medium-hard.
-      Deferred past 0.5.0: pg.ddx.io's kernel returns a scalar `float8[]`,
-      not a set, so SRF is not on its critical path; it deserves its own
-      focused release with a dedicated crash/cancel qualification rather than
-      a rushed landing.
+- [x] 2.D **Set-returning functions.** A `RETURNS SETOF <scalar/array>`
+      function whose body yields a Pure list produces one row per element,
+      collected into a tuplestore (materialize mode); each element is
+      converted with the scalar range checks. A lazy/infinite stream is
+      walked one cons cell at a time, so a body that bounds the stream
+      (`take n ...`) returns without realizing the rest, and a
+      CHECK_FOR_INTERRUPTS per row plus a hard row cap keep an unbounded body
+      cancellable rather than hanging or exhausting memory. Works in the
+      trusted interpreter. `RETURNS TABLE(...)` / SETOF composite is the
+      remaining piece (needs multi-column tuples); tracked in phase 2b.
 
 ## Phase 2b: depth
 

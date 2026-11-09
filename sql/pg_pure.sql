@@ -115,3 +115,8 @@ FROM (SELECT
    chol_solve_gsl(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[]) g,
    chol_solve(ARRAY[[4.0,12,-16],[12,37,-43],[-16,-43,98]]::float8[], ARRAY[1.0,2,3]::float8[]) p
 ) t;
+
+-- set-returning functions work in the armed trusted interpreter too
+CREATE FUNCTION trange(lo int, hi int) RETURNS SETOF int LANGUAGE pg_pure AS 'lo..hi';
+SELECT trange(3, 6);                      -- 3,4,5,6
+SELECT sum(x) FROM trange(1, 100) AS x;   -- 5050

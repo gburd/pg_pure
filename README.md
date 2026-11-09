@@ -92,7 +92,11 @@ CREATE FUNCTION primes(n int) RETURNS SETOF int LANGUAGE pg_pureu AS $$
 $$;
 SELECT * FROM primes(10);   -- 2 3 5 7 11 13 17 19 23 29
 ```
-*(Set-returning functions are on the roadmap, not in 0.1; see Status.)*
+
+The body must bound the stream itself (`take n ...`): a set-returning function
+materializes its rows before `LIMIT` applies, so `SELECT * FROM primes(10)
+LIMIT 4` still computes ten primes, and an unbounded body is stopped by cancel
+or a row cap, not by `LIMIT`.
 
 Numeric arrays: `float8[]` maps to a Pure double matrix, so vector and matrix
 math works both directions. A 1-D array is a row vector, a 2-D array an n-by-m
@@ -279,20 +283,22 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.5, in development. Working: both languages (`pg_pure` trusted via libpure
+0.6, in development. Working: both languages (`pg_pure` trusted via libpure
 safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
 float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
 `float8[]` <-> Pure double matrix, `sql::query`/`sql::exec` (with parameters
-passed as Datums), `sql::notice`/`sql::warning`, SQL-error-as-`sql::error`,
-DO blocks, the validator, preload warm-up, the add-on Pure modules
-(`using gsl`, ...), and a compiled `gsl::linalg::cholesky_solve` SPD solve. A
-Nix package builds libpure and the modules; a TAP suite covers the JIT+Pure
-crash matrix, cancel, concurrency and bounded memory. PostgreSQL 17/18/19
-pass both regression suites with `jit=on` and zero crashes.
+passed as Datums), set-returning functions (`RETURNS SETOF` of a scalar or
+array, from a Pure list or a body-bounded lazy stream), `sql::notice`/
+`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the validator, preload
+warm-up, the add-on Pure modules (`using gsl`, ...), and a compiled
+`gsl::linalg::cholesky_solve` SPD solve. A Nix package builds libpure and the
+modules; a TAP suite covers the JIT+Pure crash matrix, cancel, concurrency
+and bounded memory. PostgreSQL 17/18/19 pass both regression suites with
+`jit=on` and zero crashes.
 
-Not yet: set-returning functions, triggers, composite
-types, per-SQL-user trusted interpreters, a curated safe-mode prelude, and
-the TAP suite. See `ROADMAP.md`.
+Not yet: `RETURNS TABLE` / SETOF composite, triggers, composite types,
+per-SQL-user trusted interpreters, and a curated safe-mode prelude. See
+`ROADMAP.md`.
 
 ## Documentation
 

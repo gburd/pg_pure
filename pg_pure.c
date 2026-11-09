@@ -55,6 +55,7 @@
 #include "utils/numeric.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
+#include "utils/tuplestore.h"
 
 /*
  * max_stack_depth moved from tcop/tcopprot.h (PG <= 17) to miscadmin.h (PG
@@ -105,6 +106,7 @@ typedef struct CachedFunc
 	int			nargs;
 	Oid			argtypes[FUNC_MAX_ARGS];
 	Oid			rettype;
+	bool		retset;			/* RETURNS SETOF: the body yields a list */
 	struct CachedFunc *next;
 } CachedFunc;
 
@@ -1052,6 +1054,18 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("%s functions cannot return type %s",
 							   lang, format_type_be(proc->prorettype))));
+	/*
+	 * RETURNS SETOF <type> is supported for a supported element type; the
+	 * body yields a Pure list (or lazy stream) and each element is a row.
+	 * RETURNS TABLE(...) / SETOF <composite> (a RECORD result) is not yet
+	 * supported -- that needs multi-column tuple construction.
+	 */
+	if (proc->proretset &&
+		(proc->prorettype == RECORDOID || type_is_rowtype(proc->prorettype)))
+		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						errmsg("%s set-returning functions support only SETOF of a scalar or array type yet",
+							   lang),
+						errdetail("RETURNS TABLE(...) and SETOF composite are not yet supported.")));
 	for (int i = 0; i < nargs; i++)
 	{
 		if (!type_supported(argtypes[i]))
@@ -1143,11 +1157,147 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 	cf->nargs = nargs;
 	memcpy(cf->argtypes, argtypes, sizeof(Oid) * nargs);
 	cf->rettype = proc->prorettype;
+	cf->retset = proc->proretset;
 	ReleaseSysCache(tup);
 	return cf;
 }
 
 /* --- entry points ------------------------------------------------------ */
+
+/*
+ * A set-returning pg_pure function: the body yields a Pure list (or a lazy
+ * stream), and each element becomes one row of a single-column result. The
+ * rows are collected into a tuplestore (materialize mode). The list spine is
+ * walked one cons cell at a time with pure_force, so a lazy stream is
+ * realized incrementally and a CHECK_FOR_INTERRUPTS() between rows bounds an
+ * over-long or infinite stream by cancel / statement_timeout. res is consumed
+ * (freed) here.
+ */
+static Datum
+return_set(const char *lang, FunctionCallInfo fcinfo, CachedFunc *cf,
+		   pure_expr *res)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	TupleDesc	tupdesc;
+	Tuplestorestate *tupstore;
+	MemoryContext per_query;
+	MemoryContext oldcxt;
+	int32_t		nil = pure_sym("[]");
+	pure_expr  *cur;
+	uint64		nrows = 0;
+
+	/*
+	 * Materialize mode collects every row before the executor applies any
+	 * LIMIT, so it cannot stop an unbounded stream early. Cap the row count
+	 * so a body that yields an infinite stream fails with a clear error
+	 * instead of filling memory forever; a CHECK_FOR_INTERRUPTS() per row
+	 * also lets cancel / statement_timeout stop it. A caller that wants only
+	 * the first rows of a lazy stream should take them in Pure (take n ...).
+	 */
+#define PG_PURE_MAX_SET_ROWS	UINT64CONST(100000000)
+
+	if (!rsinfo || !IsA(rsinfo, ReturnSetInfo) ||
+		!(rsinfo->allowedModes & SFRM_Materialize))
+	{
+		pure_freenew(res);
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("%s set-returning function called in a context that cannot accept a set",
+						lang)));
+	}
+
+	/* One result column, of the SETOF element type. */
+	per_query = rsinfo->econtext->ecxt_per_query_memory;
+	oldcxt = MemoryContextSwitchTo(per_query);
+	tupdesc = CreateTemplateTupleDesc(1);
+	TupleDescInitEntry(tupdesc, 1, "value", cf->rettype, -1, 0);
+	tupstore = tuplestore_begin_heap(true, false, work_mem);
+	rsinfo->returnMode = SFRM_Materialize;
+	rsinfo->setResult = tupstore;
+	rsinfo->setDesc = tupdesc;
+	MemoryContextSwitchTo(oldcxt);
+
+	/*
+	 * Walk the list. A Pure list is either [] (the nil symbol) or an
+	 * application (:) head tail. pure_force realizes a thunk tail of a lazy
+	 * stream. Each head is converted with pure_to_datum, like a scalar
+	 * result, so the same range checks and type rules apply.
+	 */
+	cur = pure_force(res);
+	for (;;)
+	{
+		pure_expr  *f1,
+				   *head,
+				   *consf,
+				   *tail;
+		int32_t		sym;
+		Datum		d;
+		bool		isnull,
+					overflow;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (pure_is_symbol(cur, &sym) && sym == nil)
+			break;				/* end of list */
+
+		if (nrows >= PG_PURE_MAX_SET_ROWS)
+		{
+			pure_freenew(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+					 errmsg("%s set-returning function produced more than %llu rows",
+							lang, (unsigned long long) PG_PURE_MAX_SET_ROWS),
+					 errhint("A lazy or infinite Pure stream must be bounded in the body, e.g. take n stream.")));
+		}
+
+		/* Expect (:) head tail: peel two applications. */
+		if (!pure_is_app(cur, &f1, &tail) ||
+			!pure_is_app(f1, &consf, &head))
+		{
+			char	   *s = str(cur);
+			char	   *msg = pstrdup(s ? s : "?");
+
+			free(s);
+			pure_freenew(res);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("%s set-returning function must yield a list, got %s",
+							lang, msg)));
+		}
+
+		if (!pure_to_datum(head, cf->rettype, &d, &isnull, &overflow))
+		{
+			char	   *s = str(head);
+			char	   *msg = pstrdup(s ? s : "?");
+
+			free(s);
+			pure_freenew(res);
+			ereport(ERROR,
+					(errcode(overflow ? ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE
+							 : ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("%s: row value %s cannot be converted to %s",
+							lang, msg, format_type_be(cf->rettype))));
+		}
+
+		oldcxt = MemoryContextSwitchTo(per_query);
+		{
+			Datum		vals[1];
+			bool		nulls[1];
+
+			vals[0] = d;
+			nulls[0] = isnull;
+			tuplestore_putvalues(tupstore, tupdesc, vals, nulls);
+		}
+		MemoryContextSwitchTo(oldcxt);
+		nrows++;
+
+		cur = pure_force(tail);
+	}
+
+	pure_freenew(res);
+	fcinfo->isnull = true;
+	return (Datum) 0;
+}
 
 static Datum
 call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
@@ -1187,6 +1337,14 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	{
 		SPI_finish();
 		report_pure_failure(lang, "uncaught exception", exc);
+	}
+	if (cf->retset)
+	{
+		/* Collect the list into a tuplestore, then disconnect SPI. */
+		Datum		set = return_set(lang, fcinfo, cf, res);
+
+		SPI_finish();
+		return set;
 	}
 	if (!pure_to_datum(res, cf->rettype, &d, &isnull, &overflow))
 	{

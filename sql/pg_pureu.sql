@@ -176,5 +176,28 @@ SELECT mtransp(ARRAY[[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]]::float8[]);
 -- a float8[] with a NULL element cannot become a dense Pure matrix
 SELECT vid(ARRAY[1.0, NULL, 3.0]::float8[]);
 
+-- Set-returning functions: the body yields a Pure list, one row per element.
+CREATE FUNCTION pupto(n int) RETURNS SETOF int LANGUAGE pg_pureu AS '1..n';
+SELECT pupto(5);                               -- 1,2,3,4,5 as five rows
+SELECT sum(x) FROM pupto(10) AS x;             -- 55
+-- an empty result
+CREATE FUNCTION pnone() RETURNS SETOF int LANGUAGE pg_pureu AS '[]';
+SELECT count(*) FROM pnone();                  -- 0
+-- rows of a non-scalar type (float8[])
+CREATE FUNCTION pvecs(n int) RETURNS SETOF float8[] LANGUAGE pg_pureu AS
+  'map (\i -> {double i, double (i*i)}) (1..n)';
+SELECT pvecs(3);                               -- {1,1} {2,4} {3,9}
+-- text rows
+CREATE FUNCTION pwords() RETURNS SETOF text LANGUAGE pg_pureu AS '["a","bb","ccc"]';
+SELECT p, length(p) FROM pwords() AS p;
+-- a lazy stream works: the body bounds it (take n ...), then each element is
+-- a row. (A set-returning function materializes all its rows before LIMIT
+-- applies, so an unbounded stream must be bounded in the body, not by LIMIT.)
+CREATE FUNCTION pnats(n int) RETURNS SETOF int LANGUAGE pg_pureu AS
+  'take n (iterate (+1) 1)';
+SELECT pnats(4);                                -- 1,2,3,4 from a lazy stream
+-- a set-returning call used in FROM, joined with generate_series
+SELECT g, x FROM generate_series(1,2) g, pupto(2) AS x ORDER BY g, x;
+
 -- many calls of a compiled function in one statement
 SELECT sum(pmul(i, 2)) FROM generate_series(1, 100000) i;

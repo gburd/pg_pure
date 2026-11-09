@@ -191,3 +191,20 @@ FROM (SELECT
       0.000000000000
 (1 row)
 
+-- set-returning functions work in the armed trusted interpreter too
+CREATE FUNCTION trange(lo int, hi int) RETURNS SETOF int LANGUAGE pg_pure AS 'lo..hi';
+SELECT trange(3, 6);                      -- 3,4,5,6
+ trange 
+--------
+      3
+      4
+      5
+      6
+(4 rows)
+
+SELECT sum(x) FROM trange(1, 100) AS x;   -- 5050
+ sum  
+------
+ 5050
+(1 row)
+

@@ -4,6 +4,31 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.6.0] - 2026-11-09
+
+### Added
+- **Set-returning functions.** A function declared `RETURNS SETOF <type>`
+  whose body yields a Pure list produces one row per element:
+  `CREATE FUNCTION range(lo int, hi int) RETURNS SETOF int LANGUAGE pg_pure
+  AS 'lo..hi'`. The element type may be any supported scalar or `float8[]`.
+  Rows are collected into a tuplestore (materialize mode), and each element
+  is converted with the same range checks as a scalar result. Works in the
+  trusted language too.
+- A **lazy or infinite Pure stream** is walked one cons cell at a time, so a
+  stream the body itself bounds (e.g. `take n (iterate (+1) 1)`) returns its
+  rows without realizing the rest. A `CHECK_FOR_INTERRUPTS` between rows means
+  `statement_timeout` / cancel always stops a long stream and the backend
+  survives (covered by the TAP suite).
+
+### Notes
+- A set-returning function materializes all its rows before the executor
+  applies `LIMIT`, so `LIMIT` does not bound an unbounded body -- bound the
+  stream in the body (`take n ...`). An unbounded body is stopped by cancel,
+  and a hard row cap turns a runaway stream into an error rather than an
+  out-of-memory.
+- `RETURNS TABLE(...)` and `SETOF` of a composite type are not yet supported
+  (they need multi-column tuple construction); a clear error says so.
+
 ## [0.5.0] - 2026-11-09
 
 ### Added
