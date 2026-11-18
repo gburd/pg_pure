@@ -4,6 +4,23 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.6.2] - 2026-11-18
+
+### Fixed
+- **A trusted function body could escape its wrapping and define a top-level
+  Pure rule**, leaking interpreter state to another function in the same
+  backend. A body is compiled as `name args = (body);`, and a crafted body
+  (for example `0); leaked = 999; (0`) could close the parenthesis and add a
+  global definition that a later function in the same session would see. The
+  body is now required to be a single expression: it is rejected at
+  definition time if it closes a bracket it did not open or leaves one open
+  (counting brackets while skipping strings and comments). Legitimate bodies,
+  including `with`/`when` blocks and text containing brackets, are unaffected.
+  The same check applies to DO blocks. libpure's safe mode does not block
+  top-level definitions (it blocks the routes out of the language: extern,
+  inline code, eval, and native or off-allowlist using), so this guard is
+  what keeps one trusted function's interpreter state private from the next.
+
 ## [0.6.1] - 2026-11-18
 
 ### Fixed

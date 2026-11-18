@@ -141,9 +141,16 @@ Gate: phase 1 gate, plus the module tests and the property suite.
       a native or off-allowlist `using`, or a dangerous prelude function is
       refused as an SQL ERROR and the backend survives. `sql/pg_pure.sql`
       covers each route; passes on PG 17/18/19.
-- [ ] 3.3b One interpreter per SQL user (DESIGN.md 9.4): today a single armed
-      interpreter serves all `pg_pure` functions in a backend. Key it by
-      `GetUserId()` so SECURITY DEFINER functions cannot share state.
+- [ ] 3.3b One interpreter per SQL user (DESIGN.md 9.4): deferred as defense
+      in depth, not a fix for a present hole. The state-leak channel it was
+      meant to close (a body defining a top-level rule that another function
+      in the backend inherits) is closed at compile time as of 0.6.2 -- a
+      body must be a single expression. If a future need appears (a
+      multi-tenant trusted workload, or a module with mutable global state),
+      the minimal form keys an interpreter by effective `GetUserId()` for
+      SECURITY DEFINER functions only, created lazily with a small cap,
+      behind a GUC (SECURITY INVOKER functions and the GUC-off path keep
+      today's single shared interpreter).
 - [ ] 3.3c A curated `--safe` prelude (DESIGN.md 9.5) instead of the denylist,
       designed with the Pure maintainer; independent security review before
       relying on the trusted language for untrusted multi-tenant use.

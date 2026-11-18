@@ -290,10 +290,14 @@ What follows from the table:
 - **Function cache.** Entries are keyed by function oid and validated by
   the pg_proc row's xmin and tid, as PL/Perl does. A function is compiled
   as `__pg_pure_<oid> a b = (<body>);`. The parentheses keep a stray `;`
-  from defining globals. In the prototype, the body `x; helper y = y+100`
-  defined `helper` for every other function in the backend. A recompile
-  `clear`s the old rules first, because Pure appends new rules rather than
-  replacing old ones.
+  from defining globals, and the body is required to be a single expression:
+  it is rejected at compile time if it closes a bracket it did not open (the
+  only way to escape the wrapping parenthesis and reach the top level) or
+  leaves one open. In the prototype, the body `x; helper y = y+100` defined
+  `helper` for every other function in the backend; a crafted body could do
+  the same by closing the parenthesis, which the single-expression check now
+  refuses. A recompile `clear`s the old rules first, because Pure appends
+  new rules rather than replacing old ones.
 - **Calls.** Arguments are converted before the call. The call goes through
   `pure_appxv`, and the result is converted after Pure has returned.
 - **Boundary rules.** These are correctness invariants, carried over from
@@ -455,11 +459,21 @@ is a regression case in `sql/pg_pure.sql`, verified on PG 17/18/19.
 
 ### 9.4 Still to do: one interpreter per SQL user
 
-The trusted language currently uses a single armed interpreter for all
-`pg_pure` functions in a backend. DESIGN wants one per SQL user so that
-SECURITY DEFINER functions cannot share interpreter state; that is a separate
-step (key the interpreter by `GetUserId()`), weighed against the per-user
-cost (about 1.5 s and 100+ MB; an interpreter cannot be cloned).
+The trusted language uses a single armed interpreter for all `pg_pure`
+functions in a backend. A function body cannot leak a top-level definition
+into that shared interpreter: the body is compiled as a single parenthesized
+expression and is rejected at definition time if it tries to escape that
+parenthesis to add a global rule (see section 4 and the escape tests in
+`sql/pg_pure.sql`). So the practical state-leak channel between trusted
+functions is closed at compile time, not by isolating interpreters.
+
+One interpreter per effective SQL user (keyed by `GetUserId()`) remains as
+defense in depth, so that even a future relaxation of the single-expression
+rule, or a module with mutable global state, could not share state across
+users. It is deferred: it is weighed against a sharp per-user cost (about
+1.5 s and 100+ MB each; an interpreter cannot be cloned), and the minimal
+form would isolate only SECURITY DEFINER functions, lazily, behind a GUC. It
+waits behind the curated prelude (9.5) and an independent security review.
 
 ### 9.5 Still to do: a curated prelude
 

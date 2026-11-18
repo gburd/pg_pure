@@ -1106,6 +1106,68 @@ set_stack_limit(void)
 	pure_set_stack_limit(&here, (size_t) max_stack_depth * 1024L / 2);
 }
 
+/*
+ * Reject a function body that is not a single Pure expression. A body is
+ * compiled as `__pg_pure_<oid> args = (body);`, so the only way a body can
+ * introduce a top-level definition (leaking a global rule or binding that
+ * another function in the same backend would see) is to first close the
+ * wrapping parenthesis with an unmatched ')'. A single balanced expression
+ * never drives the bracket depth below zero and ends at depth zero. Scan the
+ * body counting () [] {} depth, skipping string literals and comments so a
+ * ')' inside text or a comment does not count. Return NULL if it is a single
+ * expression, else a short reason.
+ *
+ * This is a correctness boundary for the trusted language, not a nicety: it
+ * is what keeps one trusted function's interpreter state private from the
+ * next. (The same check applies to pg_pureu; there the trust domain is a
+ * single superuser, but the guarantee is cheap and uniform.)
+ */
+static const char *
+body_escapes_expression(const char *body)
+{
+	int			depth = 0;
+	const char *p = body;
+
+	while (*p)
+	{
+		if (p[0] == '/' && p[1] == '/')
+		{
+			while (*p && *p != '\n')
+				p++;
+			continue;
+		}
+		if (p[0] == '/' && p[1] == '*')
+		{
+			p += 2;
+			while (*p && !(p[0] == '*' && p[1] == '/'))
+				p++;
+			if (*p)
+				p += 2;
+			continue;
+		}
+		if (*p == '"')
+		{
+			p++;
+			while (*p && *p != '"')
+				p += (*p == '\\' && p[1]) ? 2 : 1;
+			if (*p)
+				p++;
+			continue;
+		}
+		if (*p == '(' || *p == '[' || *p == '{')
+			depth++;
+		else if (*p == ')' || *p == ']' || *p == '}')
+		{
+			if (--depth < 0)
+				return "the body closes a bracket it did not open";
+		}
+		p++;
+	}
+	if (depth != 0)
+		return "the body leaves a bracket open";
+	return NULL;
+}
+
 static CachedFunc *
 compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 {
@@ -1206,6 +1268,25 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 		appendStringInfo(&def, " %s", argnames[i]);
 	if (nargs == 0)
 		appendStringInfoString(&def, " ()");	/* a zero-arg call takes () */
+
+	/*
+	 * The body must be a single expression. Rejecting one that escapes its
+	 * parentheses is what stops a body from defining a top-level rule that a
+	 * later function in the same backend would inherit.
+	 */
+	{
+		const char *bad = body_escapes_expression(body);
+
+		if (bad)
+		{
+			pfree(def.data);
+			ReleaseSysCache(tup);
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("%s function body must be a single expression", lang),
+					 errdetail("%s.", bad)));
+		}
+	}
 	/* Parenthesize the body so a stray ';' cannot define a global rule. */
 	appendStringInfo(&def, " = (%s);\n%s;", body, fname);
 
@@ -1523,6 +1604,16 @@ inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	ip = ensure_interp(trusted);
 	pure_switch_interp(ip);
 	set_stack_limit();
+	/* The block, like a function body, must be a single expression. */
+	{
+		const char *bad = body_escapes_expression(codeblock->source_text);
+
+		if (bad)
+			ereport(ERROR,
+					(errcode(ERRCODE_SYNTAX_ERROR),
+					 errmsg("%s DO block must be a single expression", lang),
+					 errdetail("%s.", bad)));
+	}
 	/* Compile the block as a temporary niladic function, call, then clear. */
 	initStringInfo(&def);
 	appendStringInfo(&def, "__pg_pure_do () = (%s);\n", codeblock->source_text);

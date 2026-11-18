@@ -69,6 +69,19 @@ CREATE FUNCTION tnative(x int) RETURNS int LANGUAGE pg_pure AS
 CREATE FUNCTION tsys(x int) RETURNS int LANGUAGE pg_pure AS 'using system; x';
 SELECT tmul(2, 2);   -- still alive after all of the above
 
+-- a body that tries to escape its parentheses and define a top-level rule is
+-- refused at compile time, so it cannot leak interpreter state to another
+-- function in the same backend. The companion read below confirms nothing
+-- leaked.
+CREATE FUNCTION tescape(x int) RETURNS int LANGUAGE pg_pure AS
+  '0); leaked = 999; (0';
+CREATE FUNCTION treadleak(x int) RETURNS text LANGUAGE pg_pure AS 'str leaked';
+SELECT treadleak(1);   -- "leaked", unbound: the escape never ran
+-- an escape that closes a with-block and then defines a global is refused too
+CREATE FUNCTION tescape2(x int) RETURNS int LANGUAGE pg_pure AS
+  '0) end; leaked2 = 1; __z a = a when a = (0';
+SELECT tmul(2, 2);   -- still alive
+
 -- float8[] matrices in the trusted language, and the headline use case: a
 -- Cholesky solve of a small SPD system A x = b, written in pure Pure. This is
 -- the shape pg.ddx.io's commit_model_solve needs. A x = b with
