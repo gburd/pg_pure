@@ -463,13 +463,23 @@ numeric_to_pure(Datum d)
 		char	   *digits = palloc(strlen(s) + 1);
 		char	   *w = digits;
 		bool		neg = (*s == '-');
+		char	   *m;
 
 		for (char *r = s; *r; r++)
 			if (*r != '.' && *r != '-' && *r != '+')
 				*w++ = *r;
 		*w = '\0';
+		/*
+		 * Strip leading zeros from the mantissa: Pure reads a literal with a
+		 * leading zero (0333) as octal, so 0.333 would become 219%1000, and a
+		 * mantissa with an 8 or 9 digit (0.123...) fails to parse at all. Keep
+		 * at least one digit.
+		 */
+		m = digits;
+		while (m[0] == '0' && m[1] != '\0')
+			m++;
 		/* scale is bounded by numeric's digit count, so 10^scale as a literal is fine. */
-		appendStringInfo(&buf, "%s%sL%%1", neg ? "-" : "", digits);
+		appendStringInfo(&buf, "%s%sL%%1", neg ? "-" : "", m);
 		for (int i = 0; i < scale; i++)
 			appendStringInfoChar(&buf, '0');
 		appendStringInfoString(&buf, "L");
@@ -638,6 +648,81 @@ pure_to_int64(pure_expr *x, int64 *out)
 }
 
 /*
+ * Clean one part (numerator or denominator) of a Pure rational's printed form
+ * in place: drop the L bigint markers and the parentheses Pure puts around a
+ * negative numerator ((-15432L) -> -15432). Returns the first kept character,
+ * since a leading '(' is skipped rather than shifted.
+ */
+static char *
+clean_rational_part(char *s)
+{
+	char	   *w = s;
+	char	   *start = s;
+	bool		seen = false;
+
+	for (char *r = s; *r; r++)
+	{
+		if (*r == 'L' || *r == '(' || *r == ')' || *r == ' ')
+			continue;
+		if (!seen)
+		{
+			start = w;
+			seen = true;
+		}
+		*w++ = *r;
+	}
+	*w = '\0';
+	return start;
+}
+
+/*
+ * The exact number of fractional digits a rational num/den needs, when den is
+ * a positive integer: den must divide 10^k for some k, and the smallest such
+ * k is max(v2, v5) where v2 and v5 are how many times 2 and 5 divide den.
+ * Returns that k, or -1 if den has any other prime factor (the fraction does
+ * not terminate in decimal, so no finite scale is exact).
+ *
+ * den arrives as a numeric Datum because a normalized remat like 15432%125
+ * (from 123.456) no longer has a power-of-ten denominator; the old
+ * digit-count heuristic rounded such values. This factors den directly.
+ */
+static int
+terminating_scale(Datum den)
+{
+	Datum		zero = DirectFunctionCall1(int4_numeric, Int32GetDatum(0));
+	Datum		two = DirectFunctionCall1(int4_numeric, Int32GetDatum(2));
+	Datum		five = DirectFunctionCall1(int4_numeric, Int32GetDatum(5));
+	Datum		one = DirectFunctionCall1(int4_numeric, Int32GetDatum(1));
+	Datum		v = den;
+	int			v2 = 0,
+				v5 = 0;
+
+	/* Divide out all factors of 2, then all factors of 5. */
+	for (;;)
+	{
+		Datum		r = DirectFunctionCall2(numeric_mod, v, two);
+
+		if (DatumGetBool(DirectFunctionCall2(numeric_ne, r, zero)))
+			break;
+		v = DirectFunctionCall2(numeric_div_trunc, v, two);
+		v2++;
+	}
+	for (;;)
+	{
+		Datum		r = DirectFunctionCall2(numeric_mod, v, five);
+
+		if (DatumGetBool(DirectFunctionCall2(numeric_ne, r, zero)))
+			break;
+		v = DirectFunctionCall2(numeric_div_trunc, v, five);
+		v5++;
+	}
+	/* What remains must be 1 for the fraction to terminate. */
+	if (DatumGetBool(DirectFunctionCall2(numeric_ne, v, one)))
+		return -1;
+	return v2 > v5 ? v2 : v5;
+}
+
+/*
  * Pure -> Datum, range-checked. Returns false if x has no representation in
  * type (the caller reports a type mismatch) and sets *overflow when x is the
  * right kind of number but out of the type's range (the caller raises
@@ -742,14 +827,16 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 					 * Rational "NUM L % DEN L". numeric_div picks a result scale
 					 * from the operand magnitudes, which for large operands
 					 * rounds the fraction away. Force a scale wide enough: for a
-					 * power-of-ten denominator (the form numeric_to_pure built)
-					 * the digit count of DEN minus one is exact; otherwise it is a
-					 * sensible display scale. A non-terminating rational like 1%3
-					 * is rounded to that scale, as numeric division always is.
+					 * numeric_to_pure builds mantissa % 10^k, but the math module
+					 * returns the rational in lowest terms, so the denominator is no
+					 * longer a power of ten (123.456 comes back as 15432 % 125). The
+					 * exact number of fractional digits is therefore derived from the
+					 * denominator's factors of 2 and 5, not its digit count. A
+					 * non-terminating rational (1 % 3) has no finite exact scale and is
+					 * rounded to a display scale, as numeric division always is.
 					 */
 					char	   *num = pstrdup(t);
 					char	   *den;
-					int			den_digits;
 					int			scale;
 					Datum		nn,
 								dd,
@@ -757,40 +844,48 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 
 					den = strchr(num, '%');
 					*den++ = '\0';
-					for (char *p = num; *p; p++)
-						if (*p == 'L')
-							*p = '\0';
-					for (char *p = den; *p; p++)
-						if (*p == 'L')
-							*p = '\0';
+
 					/*
-					 * numeric_to_pure writes a terminating fraction as
-					 * mantissa % 10^k, so the denominator "1" followed by k zeros
-					 * has k+1 characters and the exact scale is k.
+					 * Pure prints a rational as NUM L % DEN L, and wraps a negative
+					 * numerator in parentheses: (-15432L)%125L. Strip the L markers
+					 * and the parentheses, in place, from both parts.
 					 */
-					den_digits = (int) strlen(den) - (den[0] == '-' ? 1 : 0);
-					scale = den_digits > 1 ? den_digits - 1 : 1;
-					if (scale > NUMERIC_MAX_DISPLAY_SCALE)
-						scale = NUMERIC_MAX_DISPLAY_SCALE;
+					num = clean_rational_part(num);
+					den = clean_rational_part(den);
 					nn = DirectFunctionCall3(numeric_in, CStringGetDatum(num),
+											 ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
+					dd = DirectFunctionCall3(numeric_in, CStringGetDatum(den),
 											 ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
 
 					/*
-					 * Give the divisor a display scale so numeric_div keeps that
-					 * many fractional digits in the quotient; without it the
-					 * division of large operands rounds the fraction away.
+					 * The exact fractional-digit count if the fraction terminates;
+					 * otherwise a display scale so a repeating fraction still returns
+					 * a sensible rounded value.
+					 */
+					scale = terminating_scale(dd);
+					if (scale < 0)
+						scale = NUMERIC_MAX_DISPLAY_SCALE;
+					else if (scale > NUMERIC_MAX_DISPLAY_SCALE)
+						scale = NUMERIC_MAX_DISPLAY_SCALE;
+
+					/*
+					 * numeric_div chooses its result scale from the operand
+					 * magnitudes, which for a large numerator drops the last
+					 * fractional digits. Give the dividend that many fractional
+					 * digits up front (append a point and scale zeros) so the
+					 * quotient carries them, then round to the exact scale.
 					 */
 					{
-						StringInfoData dbuf;
+						StringInfoData nbuf;
 
-						initStringInfo(&dbuf);
-						appendStringInfoString(&dbuf, den);
-						appendStringInfoChar(&dbuf, '.');
+						initStringInfo(&nbuf);
+						appendStringInfoString(&nbuf, num);
+						appendStringInfoChar(&nbuf, '.');
 						for (int z = 0; z < scale; z++)
-							appendStringInfoChar(&dbuf, '0');
-						dd = DirectFunctionCall3(numeric_in, CStringGetDatum(dbuf.data),
+							appendStringInfoChar(&nbuf, '0');
+						nn = DirectFunctionCall3(numeric_in, CStringGetDatum(nbuf.data),
 												 ObjectIdGetDatum(InvalidOid), Int32GetDatum(-1));
-						pfree(dbuf.data);
+						pfree(nbuf.data);
 					}
 					q = DirectFunctionCall2(numeric_div, nn, dd);
 					*d = DirectFunctionCall2(numeric_round, q, Int32GetDatum(scale));

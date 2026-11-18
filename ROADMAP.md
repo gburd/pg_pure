@@ -54,8 +54,13 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
 - [x] 1.5 Set-returning functions -> done in phase 2.D (SETOF scalar/array;
       RETURNS TABLE / SETOF composite remain in phase 2b). Triggers and
       procedures remain in phase 2b.
-- [ ] 1.6 Preloading: the `_PG_init` warm-up code exists but is not yet
-      tested end to end; confirm backends inherit it and measure.
+- [ ] 1.6 Preloading: measured end to end (`t/004_preload.pl`). The
+      `_PG_init` warm-up runs in the postmaster (a preloaded start takes
+      seconds, warming both interpreters), but a forked backend still pays the
+      per-function LLVM codegen on its first call: the warmed JIT state is not
+      effectively inherited across fork, so preload does not lower first-call
+      latency today. A connection pooler, which keeps backends warm, is the
+      current answer. Making warm state survive fork is open (likely libpure).
 - [x] 1.7 TAP tests: crash safety (JIT plus Pure in both orders, checked in
       the server log -- `t/001_crash_matrix.pl`, 0-crash on a JIT-enabled
       PG 17/18/19); cancel and `pg_terminate_backend`; 8 concurrent backends;
@@ -116,9 +121,12 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
 - [ ] 2.4 Vet modules and promote them to the tested list, each with a
       regression test inside PostgreSQL: gsl, mpfr, csv, xml, stldict,
       stllib, rational. Fix pure-glpk's error hook in the fork.
-- [ ] 2.5 hegel property tests for the conversions: for generated values of
-      each type, `identity(v) = v`, and every value out of range is an
-      ERROR, never a wrong answer.
+- [x] 2.5 Property round-trip tests for the conversions (`t/003_conversions.pl`):
+      for generated values of each supported type, `identity(v) = v`, and a
+      value out of range is an ERROR, never a wrong answer. These found and
+      guard a numeric precision bug fixed in 0.6.1. (Written as a TAP test,
+      not a hegel C harness: the conversion only runs through a live backend,
+      so the oracle is a SQL value round-tripped through a pg_pure function.)
 - [ ] 2.6 Benchmarks against PL/pgSQL, PL/Python and PL/Perl: interleaved
       runs and medians, method and box recorded under `bench/` with a date.
 

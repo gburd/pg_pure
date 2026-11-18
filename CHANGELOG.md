@@ -4,6 +4,40 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.6.1] - 2026-11-18
+
+### Fixed
+- **numeric round-trip lost precision.** A `numeric` value with a fractional
+  part could come back changed: `123.456` returned `123.46`, and
+  `0.333` returned `0.219`. Two causes, both in the numeric conversion.
+  Passing a value in, the fractional mantissa kept its leading zeros
+  (`0.333` built the Pure literal `0333`, which Pure reads as octal `219`);
+  a mantissa with an `8` or `9` digit (`0.123456789012345`) was invalid octal
+  and raised a spurious "cannot represent numeric value" error. Returning a
+  value, the result scale was derived from the rational's denominator
+  assuming it was a power of ten, but the math module returns the rational in
+  lowest terms (`123.456` as `15432/125`), so the value was rounded to too
+  few digits. A negative value (`-0.25`) and a large-magnitude value
+  (`1234567890.123456789`) were also mishandled. All `numeric` values now
+  round-trip exactly; a non-terminating rational is rounded to a display
+  scale, as numeric division always is.
+
+### Added
+- **Property round-trip tests for the type conversions** (`t/003_conversions.pl`):
+  across each supported type (int2/4/8, float4/8, numeric, bool, text,
+  `float8[]`), generated values round-trip through a pg_pure identity
+  function exactly, and a value that does not fit its type is an error, never
+  a silent wrap or truncation. This is the test that found the numeric bug
+  above.
+- **A preload behaviour test** (`t/004_preload.pl`): a server with
+  `shared_preload_libraries = 'pg_pure'` starts, warms, and serves Pure from
+  forked backends without a crash. It records the first-call latency with and
+  without preload. Note: preload currently front-loads the one-time codegen
+  into postmaster startup but does not lower a forked backend's first-call
+  latency; the warmed interpreter state is not effectively inherited across
+  fork. A connection pooler, which keeps backends warm, is the way to avoid
+  the cost today.
+
 ## [0.6.0] - 2026-11-09
 
 ### Added
