@@ -116,6 +116,8 @@ validator rejects such names.
 | bool | 1 or 0 (Pure's `true` and `false`) | int; nonzero is true |
 | text, varchar, char, name | string, converted to UTF-8 | strings only |
 | float8[] | a Pure double matrix (1-D -> 1-by-n row vector, 2-D -> n-by-m); no NULL elements, <=2 dims (implemented, 0.3) | a double matrix back to float8[] (1-row -> 1-D, else 2-D) |
+| bytea | a Pure int matrix (1-by-n) of byte values 0..255 (implemented, 0.7) | an int matrix back to bytea; an element outside 0..255 is an ERROR |
+| a domain | its base type's Pure value (implemented, 0.7); the domain's constraints are enforced on the argument and the result | its base type; the domain CHECK runs on the result |
 | other arrays, composite types, record | planned: lists / record `{"col"=>value}` (not yet) | planned |
 | NULL | `sql::null` | `sql::null` |
 | any other type | its text form, as a string | a string, passed to the type's input function |

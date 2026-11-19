@@ -340,6 +340,60 @@ SELECT count(*) FROM do_marker;
 -- unsupported types are rejected up front
 CREATE FUNCTION pjson(x json) RETURNS int LANGUAGE pg_pureu AS '1';
 ERROR:  pg_pureu functions cannot take type json
+-- a domain is accepted as its base type, and the domain's constraints are
+-- enforced on the argument (by PostgreSQL) and on the result (by pg_pure).
+CREATE DOMAIN posint AS int4 CHECK (VALUE > 0);
+CREATE FUNCTION pdom(x posint) RETURNS posint LANGUAGE pg_pureu AS 'x + 1';
+SELECT pdom(41);                    -- 42: base-type conversion both ways
+ pdom 
+------
+   42
+(1 row)
+
+SELECT pdom(0);                     -- ERROR: argument violates the domain
+ERROR:  value for domain posint violates check constraint "posint_check"
+CREATE FUNCTION pdomneg(x int4) RETURNS posint LANGUAGE pg_pureu AS 'x - 100';
+SELECT pdomneg(150);                -- 50
+ pdomneg 
+---------
+      50
+(1 row)
+
+SELECT pdomneg(1);                  -- ERROR: result (1-100) violates posint
+ERROR:  value for domain posint violates check constraint "posint_check"
+-- bytea maps to a Pure int matrix of byte values (0..255), so arbitrary
+-- binary -- including embedded NUL -- round-trips, and a body can read or
+-- build the bytes. An element outside 0..255 is an error, not a wrap.
+CREATE FUNCTION bid(x bytea) RETURNS bytea LANGUAGE pg_pureu AS 'x';
+SELECT bid('\x'::bytea);            -- empty
+ bid 
+-----
+ \x
+(1 row)
+
+SELECT bid('\x004100ff'::bytea);    -- embedded NUL survives
+    bid     
+------------
+ \x004100ff
+(1 row)
+
+CREATE FUNCTION bsum(x bytea) RETURNS int LANGUAGE pg_pureu AS 'foldl (+) 0 (list x)';
+SELECT bsum('\x010203'::bytea);     -- 6
+ bsum 
+------
+    6
+(1 row)
+
+CREATE FUNCTION bmk() RETURNS bytea LANGUAGE pg_pureu AS '{65,66,67}';
+SELECT bmk();                        -- \x414243
+   bmk    
+----------
+ \x414243
+(1 row)
+
+CREATE FUNCTION bbad() RETURNS bytea LANGUAGE pg_pureu AS '{65,300,67}';
+SELECT bbad();                       -- ERROR: 300 is out of range for a byte
+ERROR:  pg_pureu: result {65,300,67} is out of range for bytea
 -- float8[] <-> Pure matrix (see sql/pg_pure.sql for the trusted-language and
 -- Cholesky-solve cases; these cover the untrusted mapping both directions)
 CREATE FUNCTION vid(v float8[]) RETURNS float8[] LANGUAGE pg_pureu AS 'v';

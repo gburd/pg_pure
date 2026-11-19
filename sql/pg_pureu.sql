@@ -160,6 +160,29 @@ SELECT count(*) FROM do_marker;
 -- unsupported types are rejected up front
 CREATE FUNCTION pjson(x json) RETURNS int LANGUAGE pg_pureu AS '1';
 
+-- a domain is accepted as its base type, and the domain's constraints are
+-- enforced on the argument (by PostgreSQL) and on the result (by pg_pure).
+CREATE DOMAIN posint AS int4 CHECK (VALUE > 0);
+CREATE FUNCTION pdom(x posint) RETURNS posint LANGUAGE pg_pureu AS 'x + 1';
+SELECT pdom(41);                    -- 42: base-type conversion both ways
+SELECT pdom(0);                     -- ERROR: argument violates the domain
+CREATE FUNCTION pdomneg(x int4) RETURNS posint LANGUAGE pg_pureu AS 'x - 100';
+SELECT pdomneg(150);                -- 50
+SELECT pdomneg(1);                  -- ERROR: result (1-100) violates posint
+
+-- bytea maps to a Pure int matrix of byte values (0..255), so arbitrary
+-- binary -- including embedded NUL -- round-trips, and a body can read or
+-- build the bytes. An element outside 0..255 is an error, not a wrap.
+CREATE FUNCTION bid(x bytea) RETURNS bytea LANGUAGE pg_pureu AS 'x';
+SELECT bid('\x'::bytea);            -- empty
+SELECT bid('\x004100ff'::bytea);    -- embedded NUL survives
+CREATE FUNCTION bsum(x bytea) RETURNS int LANGUAGE pg_pureu AS 'foldl (+) 0 (list x)';
+SELECT bsum('\x010203'::bytea);     -- 6
+CREATE FUNCTION bmk() RETURNS bytea LANGUAGE pg_pureu AS '{65,66,67}';
+SELECT bmk();                        -- \x414243
+CREATE FUNCTION bbad() RETURNS bytea LANGUAGE pg_pureu AS '{65,300,67}';
+SELECT bbad();                       -- ERROR: 300 is out of range for a byte
+
 -- float8[] <-> Pure matrix (see sql/pg_pure.sql for the trusted-language and
 -- Cholesky-solve cases; these cover the untrusted mapping both directions)
 CREATE FUNCTION vid(v float8[]) RETURNS float8[] LANGUAGE pg_pureu AS 'v';

@@ -116,8 +116,13 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
       `sql::prepare`.
 - [ ] 2.2 `sql::stream q`: a lazy stream backed by a cursor. Forcing it
       after its call has returned must throw, never crash.
-- [ ] 2.3 bytea (choose between a blob and a byte matrix), domains, and an
-      explicit subtransaction block.
+- [x] 2.3 bytea and domains (0.7). bytea maps to a Pure int matrix of byte
+      values (arbitrary binary, embedded NUL, out-of-range element is an
+      error); a domain is accepted as its base type with its CHECK enforced
+      on the argument and the result. An explicit user-visible subtransaction
+      block (`sql::atomic` or similar) is still open: `sql::query`/`sql::exec`
+      already run in an internal subtransaction, so this is a smaller
+      ergonomics item, deferred.
 - [ ] 2.4 Vet modules and promote them to the tested list, each with a
       regression test inside PostgreSQL: gsl, mpfr, csv, xml, stldict,
       stllib, rational. Fix pure-glpk's error hook in the fork.

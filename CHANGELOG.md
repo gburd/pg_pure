@@ -4,6 +4,21 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.7.0] - 2026-11-18
+
+### Added
+- **bytea.** A `bytea` argument maps to a Pure int matrix (a 1-by-n row of
+  byte values 0..255), and a function returning `bytea` yields one. Because
+  the bytes live in a matrix, not a string, arbitrary binary -- including
+  embedded NUL -- round-trips, and a body can read the bytes (`list x`) or
+  build them (`{65,66,67}`). A matrix element outside 0..255 is an error, not
+  a silent wrap.
+- **Domains.** A domain-typed argument or return value is accepted as its
+  base type. The domain's CHECK constraints are enforced: PostgreSQL checks
+  the argument, and pg_pure checks the function's result (`CREATE DOMAIN
+  posint AS int4 CHECK (VALUE > 0)` rejects a function that returns a
+  non-positive value).
+
 ## [0.6.2] - 2026-11-18
 
 ### Fixed

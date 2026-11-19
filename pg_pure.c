@@ -42,6 +42,7 @@
 #include "commands/event_trigger.h"
 #include "commands/trigger.h"
 #include "executor/spi.h"
+#include "executor/execExpr.h"
 #include "fmgr.h"
 #include "funcapi.h"
 #include "miscadmin.h"
@@ -107,6 +108,8 @@ typedef struct CachedFunc
 	Oid			argtypes[FUNC_MAX_ARGS];
 	Oid			rettype;
 	bool		retset;			/* RETURNS SETOF: the body yields a list */
+	void	   *domain_extra;	/* cached domain constraints, if rettype is one */
+	MemoryContext domain_cxt;	/* context domain_extra lives in */
 	struct CachedFunc *next;
 } CachedFunc;
 
@@ -411,6 +414,8 @@ pg_pure_warning(const char *msg)
 static bool
 type_supported(Oid t)
 {
+	/* A domain is supported exactly when its base type is. */
+	t = getBaseType(t);
 	switch (t)
 	{
 		case INT2OID:
@@ -423,6 +428,7 @@ type_supported(Oid t)
 		case VARCHAROID:
 		case NUMERICOID:
 		case FLOAT8ARRAYOID:
+		case BYTEAOID:
 			return true;
 		default:
 			return false;
@@ -560,11 +566,86 @@ float8array_to_pure(Datum d)
 	return x;
 }
 
+/*
+ * bytea -> Pure. The bytes become a 1-by-n Pure int matrix, each element one
+ * byte value (0..255). An int matrix holds any byte, including NUL, which a
+ * Pure string cannot, so this round-trips arbitrary binary data. An empty
+ * bytea becomes an empty matrix.
+ */
+static pure_expr *
+bytea_to_pure(Datum d)
+{
+	bytea	   *b = DatumGetByteaPP(d);
+	uint32_t	n = (uint32_t) VARSIZE_ANY_EXHDR(b);
+	unsigned char *p = (unsigned char *) VARDATA_ANY(b);
+	int		   *ints;
+	pure_expr  *x;
+
+	if (n == 0)
+		return matrix_from_int_array(0, 0, NULL);
+	ints = palloc(sizeof(int) * n);
+	for (uint32_t i = 0; i < n; i++)
+		ints[i] = p[i];
+	x = matrix_from_int_array(1, n, ints);	/* copies ints */
+	pfree(ints);
+	if (!x)
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("pg_pure: could not build a Pure matrix from the bytea")));
+	return x;
+}
+
+/*
+ * Pure -> bytea. The value must be a Pure int matrix (or int vector); each
+ * element is one byte and must be in 0..255, else the value does not fit a
+ * byte and it is an error (never a silent truncation). Returns false on a
+ * type mismatch so the caller reports it; sets *overflow for an out-of-range
+ * element.
+ */
+static bool
+pure_to_bytea(pure_expr *x, Datum *d, bool *overflow)
+{
+	void	   *mp;
+	uint32_t	sz;
+	int		   *ints;
+	bytea	   *b;
+	unsigned char *w;
+
+	if (!pure_is_int_matrix(x, &mp))
+		return false;
+	sz = matrix_size(x);
+	b = (bytea *) palloc(VARHDRSZ + (sz ? sz : 0));
+	SET_VARSIZE(b, VARHDRSZ + sz);
+	if (sz == 0)
+	{
+		*d = PointerGetDatum(b);
+		return true;
+	}
+	ints = palloc(sizeof(int) * sz);
+	matrix_to_int_array(ints, x);	/* respects stride */
+	w = (unsigned char *) VARDATA(b);
+	for (uint32_t i = 0; i < sz; i++)
+	{
+		if (ints[i] < 0 || ints[i] > 255)
+		{
+			pfree(ints);
+			pfree(b);
+			*overflow = true;
+			return false;
+		}
+		w[i] = (unsigned char) ints[i];
+	}
+	pfree(ints);
+	*d = PointerGetDatum(b);
+	return true;
+}
+
 static pure_expr *
 datum_to_pure(Datum d, bool isnull, Oid type)
 {
 	if (isnull)
 		return pure_symbol(sym_sql_null);
+	type = getBaseType(type);	/* a domain converts as its base type */
 	switch (type)
 	{
 		case INT2OID:
@@ -583,6 +664,8 @@ datum_to_pure(Datum d, bool isnull, Oid type)
 			return numeric_to_pure(d);
 		case FLOAT8ARRAYOID:
 			return float8array_to_pure(d);
+		case BYTEAOID:
+			return bytea_to_pure(d);
 		default:
 			{
 				/* text, varchar, and (via SPI) any other type: its text form */
@@ -739,6 +822,8 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 
 	*isnull = false;
 	*overflow = false;
+	/* A domain converts as its base type; the caller runs the constraint. */
+	type = getBaseType(type);
 	if (pure_is_symbol(x, &sym) && sym == sym_sql_null)
 	{
 		*isnull = true;
@@ -971,6 +1056,8 @@ pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow)
 				*d = PointerGetDatum(arr);
 				return true;
 			}
+		case BYTEAOID:
+			return pure_to_bytea(x, d, overflow);
 	}
 	return false;
 }
@@ -1334,6 +1421,9 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 	memcpy(cf->argtypes, argtypes, sizeof(Oid) * nargs);
 	cf->rettype = proc->prorettype;
 	cf->retset = proc->proretset;
+	/* Reset the domain-constraint cache: the return type may have changed. */
+	cf->domain_extra = NULL;
+	cf->domain_cxt = TopMemoryContext;
 	ReleaseSysCache(tup);
 	return cf;
 }
@@ -1543,6 +1633,9 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 						 "unmatched application stays unevaluated in Pure.")));
 	}
 	pure_freenew(res);
+	/* If the declared return type is a domain, enforce its constraints. */
+	if (cf->rettype != getBaseType(cf->rettype))
+		domain_check(d, isnull, cf->rettype, &cf->domain_extra, cf->domain_cxt);
 	/* Copy a by-reference result out of SPI's memory before SPI_finish. */
 	if (!isnull && !get_typbyval(cf->rettype))
 		d = SPI_datumTransfer(d, false, get_typlen(cf->rettype));
