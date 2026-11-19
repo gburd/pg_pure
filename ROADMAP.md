@@ -184,6 +184,9 @@ for untrusted multi-tenant workloads.
   (github.com/gburd/pg_pure), not Codeberg.
 - 2026-10-28: support PG 17, 18 and 19 (19 via the PGDG snapshot repo until
   release). FreeBSD is a supported platform; Windows is not (DESIGN.md 10).
+- 2026-11-19: PostgreSQL 19.0 reached GA. CI and the release build now
+  install it from the released PGDG repo, not the snapshot; the snapshot
+  repo line is removed.
 - 2026-10-27: a PostgreSQL built without LLVM (no `postgresql-NN-jit`) is a
   supported deployment and needs no libpure symbol fix; it gives up the
   server's own JIT. DESIGN.md section 5a. (Greg is also moving PostgreSQL to

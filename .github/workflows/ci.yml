@@ -59,9 +59,6 @@ jobs:
           CODENAME=$(lsb_release -cs)
           echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg main" \
             | sudo tee /etc/apt/sources.list.d/pgdg.list >/dev/null
-          # PG 19 is unreleased; it lives in the -pgdg-snapshot repo.
-          echo "deb [signed-by=/usr/share/postgresql-common/pgdg/apt.postgresql.org.asc] https://apt.postgresql.org/pub/repos/apt ${CODENAME}-pgdg-snapshot main 19" \
-            | sudo tee /etc/apt/sources.list.d/pgdg-snapshot.list >/dev/null
           sudo apt-get update
 
       - name: Install the LLVM/Pure build deps
@@ -113,13 +110,8 @@ jobs:
 
       - name: Install PostgreSQL ${{ matrix.pg }} WITHOUT the JIT package
         run: |
-          if [ "${{ matrix.pg }}" = "19" ]; then
-            sudo apt-get install -y --no-install-recommends -t "$(lsb_release -cs)-pgdg-snapshot" \
-              postgresql-19 postgresql-server-dev-19 libpq-dev libpq5
-          else
-            sudo apt-get install -y --no-install-recommends \
-              postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
-          fi
+          sudo apt-get install -y --no-install-recommends \
+            postgresql-${{ matrix.pg }} postgresql-server-dev-${{ matrix.pg }}
           # Ensure no llvmjit is present (a clean image has none, but be explicit).
           sudo apt-get remove -y postgresql-${{ matrix.pg }}-jit 2>/dev/null || true
 

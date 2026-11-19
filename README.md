@@ -144,8 +144,8 @@ bigint, or `sql::null`). The no-parameter forms `sql::query q` and
 
 ## Requirements
 
-- PostgreSQL **17, 18, or 19**. All three build and pass the regression suite
-  (gated in CI; 19 against the PGDG snapshot until it is released).
+- PostgreSQL **17, 18, or 19**. All three build and pass the regression suite,
+  gated in CI against the released PGDG packages.
 - **libpure**, built from the fork below. It is not packaged; you build it once.
 - A C toolchain and the server headers (`postgresql-server-dev-NN`).
 

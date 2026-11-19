@@ -4,6 +4,16 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.7.1] - 2026-11-19
+
+### Changed
+- PostgreSQL 19 reached general availability. CI and the release build now
+  install it from the released PGDG repository instead of the snapshot
+  repository. The extension is unchanged; it builds and passes the regression
+  and TAP suites on PostgreSQL 17.12, 18.7 and 19.0, with `jit=on` and zero
+  crashes (libpure's hidden LLVM symbols coexist with the released PG 19
+  llvmjit).
+
 ## [0.7.0] - 2026-11-18
 
 ### Added
