@@ -506,6 +506,50 @@ SELECT g, x FROM generate_series(1,2) g, pupto(2) AS x ORDER BY g, x;
  2 | 2
 (4 rows)
 
+-- Vetted add-on Pure modules, each exercised through a real operation. These
+-- are built and installed alongside libpure (see the CI/release workflows).
+-- mpfr: arbitrary-precision floats. pi at 200 bits has far more correct
+-- digits than a 53-bit double.
+CREATE FUNCTION mpfr_pi(bits int) RETURNS text LANGUAGE pg_pureu AS
+$PURE$ using mpfr; mpfr_set_default_prec bits $$ str (4*atan (mpfr 1)) $PURE$;
+SELECT mpfr_pi(53);                     -- 3.1415926535897931 (double precision)
+      mpfr_pi       
+--------------------
+ 3.1415926535897931
+(1 row)
+
+SELECT mpfr_pi(200);                    -- 60 correct digits of pi
+                             mpfr_pi                             
+-----------------------------------------------------------------
+ 3.1415926535897932384626433832795028841971693993751058209749445
+(1 row)
+
+-- stldict (dict): an STL-backed associative map.
+CREATE FUNCTION dict_sum() RETURNS int LANGUAGE pg_pureu AS
+$PURE$ using dict; foldl (+) 0 (map (\(_=>v) -> v) (members (dict ["a"=>10,"b"=>20,"c"=>30]))) $PURE$;
+SELECT dict_sum();                      -- 60
+ dict_sum 
+----------
+       60
+(1 row)
+
+CREATE FUNCTION dict_get(k text) RETURNS int LANGUAGE pg_pureu AS
+$PURE$ using dict; (dict ["x"=>1,"y"=>2]) ! k $PURE$;
+SELECT dict_get('y');                   -- 2
+ dict_get 
+----------
+        2
+(1 row)
+
+-- rational: utilities on math's exact rationals, e.g. a double to a fraction.
+CREATE FUNCTION rat_of(x float8) RETURNS text LANGUAGE pg_pureu AS
+$PURE$ using rational; str (rational x) $PURE$;
+SELECT rat_of(0.75);                    -- 3L%4L
+ rat_of 
+--------
+ 3L%4L
+(1 row)
+
 -- many calls of a compiled function in one statement
 SELECT sum(pmul(i, 2)) FROM generate_series(1, 100000) i;
      sum     

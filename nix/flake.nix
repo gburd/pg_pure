@@ -88,17 +88,61 @@
           };
         };
 
+        # A helper for the remaining vetted modules, which share the plain
+        # Makefile shape: build against this libpure, install into $out, and
+        # rpath any shared object back to its native libraries.
+        mkPureModule = { name, buildInputs ? [], rpathLibs ? [] }:
+          pkgs.stdenv.mkDerivation {
+            pname = "pure-${name}";
+            version = libpure.version;
+            src = pure-lang;
+            sourceRoot = "source/pure-${name}";
+            nativeBuildInputs = [ pkgs.pkg-config pkgs.patchelf ];
+            buildInputs = [ libpure ] ++ buildInputs;
+            makeFlags = [ "prefix=${placeholder "out"}" "libdir=${placeholder "out"}/lib" ];
+            installFlags = [ "prefix=${placeholder "out"}" "libdir=${placeholder "out"}/lib" ];
+            # Point any installed .so at libpure and its native libs so it
+            # resolves without the caller setting LD_LIBRARY_PATH.
+            postInstall = pkgs.lib.optionalString (rpathLibs != []) ''
+              for so in $out/lib/pure/*.so; do
+                [ -e "$so" ] || continue
+                patchelf --set-rpath "${pkgs.lib.makeLibraryPath (rpathLibs ++ [ libpure ])}" "$so"
+              done
+            '';
+            meta = with pkgs.lib; {
+              description = "Pure ${name} module (gburd fork)";
+              homepage = "https://github.com/gburd/pure-lang";
+              license = licenses.gpl3Plus;
+              platforms = platforms.unix;
+            };
+          };
+
+        # mpfr: arbitrary-precision floats (links libmpfr and gmp).
+        pure-mpfr = mkPureModule {
+          name = "mpfr";
+          buildInputs = [ pkgs.mpfr pkgs.gmp ];
+          rpathLibs = [ pkgs.mpfr pkgs.gmp ];
+        };
+        # stldict: STL-backed associative maps (C++). runtime.h pulls in
+        # gmp.h and mpfr.h, so it needs those headers at build time.
+        pure-stldict = mkPureModule {
+          name = "stldict";
+          buildInputs = [ pkgs.gmp pkgs.mpfr ];
+        };
+        # rational: utilities on math's exact rationals (pure Pure, no .so).
+        pure-rational = mkPureModule { name = "rational"; };
+
         # A single prefix with libpure and the vetted modules merged, which is
         # what a host points PURE_PREFIX / PURELIB at. PURELIB must list both
         # the libpure prelude dir and the module dir.
         pure-with-modules = pkgs.symlinkJoin {
           name = "pure-with-modules-${libpure.version}";
-          paths = [ libpure pure-gsl ];
+          paths = [ libpure pure-gsl pure-mpfr pure-stldict pure-rational ];
         };
       in
       {
         packages = {
-          inherit libpure pure-gsl pure-with-modules;
+          inherit libpure pure-gsl pure-mpfr pure-stldict pure-rational pure-with-modules;
           default = pure-with-modules;
         };
 

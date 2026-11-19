@@ -13,6 +13,9 @@ operational blocker; see pg_pure's ROADMAP phase 2.A.)
   different LLVM (DESIGN.md section 5).
 - `packages.pure-gsl` -- the GSL bindings, including
   `gsl::linalg::cholesky_solve` (the compiled SPD solve pg_pure exposes).
+- `packages.pure-mpfr`, `packages.pure-stldict`, `packages.pure-rational` --
+  the other vetted modules: arbitrary-precision floats (`mpfr`), STL-backed
+  maps (`dict`), and exact-rational utilities (`rational`).
 - `packages.pure-with-modules` (the default) -- libpure and the modules merged
   into one prefix, which is what you point `PURE_PREFIX` / `PURELIB` at.
 - `devShells.default` -- a shell with `pure` on `PATH` and `PURELIB` set.

@@ -123,9 +123,13 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
       block (`sql::atomic` or similar) is still open: `sql::query`/`sql::exec`
       already run in an internal subtransaction, so this is a smaller
       ergonomics item, deferred.
-- [ ] 2.4 Vet modules and promote them to the tested list, each with a
-      regression test inside PostgreSQL: gsl, mpfr, csv, xml, stldict,
-      stllib, rational. Fix pure-glpk's error hook in the fork.
+- [x] 2.4 Vet modules and promote them to the tested list, each with an
+      in-database regression test: gsl/gsl::linalg (0.3/0.4), and mpfr, dict
+      (stldict) and rational (0.8). All are built and installed by the dev,
+      CI and release workflows. csv, xml and stllib build but are not yet
+      promoted (csv/xml are file/document oriented, awkward in a
+      single-expression body); glpk needs an ODBC lib and a fork-side fix to
+      its error hook, tracked separately.
 - [x] 2.5 Property round-trip tests for the conversions (`t/003_conversions.pl`):
       for generated values of each supported type, `identity(v) = v`, and a
       value out of range is an ERROR, never a wrong answer. These found and

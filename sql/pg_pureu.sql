@@ -222,5 +222,25 @@ SELECT pnats(4);                                -- 1,2,3,4 from a lazy stream
 -- a set-returning call used in FROM, joined with generate_series
 SELECT g, x FROM generate_series(1,2) g, pupto(2) AS x ORDER BY g, x;
 
+-- Vetted add-on Pure modules, each exercised through a real operation. These
+-- are built and installed alongside libpure (see the CI/release workflows).
+-- mpfr: arbitrary-precision floats. pi at 200 bits has far more correct
+-- digits than a 53-bit double.
+CREATE FUNCTION mpfr_pi(bits int) RETURNS text LANGUAGE pg_pureu AS
+$PURE$ using mpfr; mpfr_set_default_prec bits $$ str (4*atan (mpfr 1)) $PURE$;
+SELECT mpfr_pi(53);                     -- 3.1415926535897931 (double precision)
+SELECT mpfr_pi(200);                    -- 60 correct digits of pi
+-- stldict (dict): an STL-backed associative map.
+CREATE FUNCTION dict_sum() RETURNS int LANGUAGE pg_pureu AS
+$PURE$ using dict; foldl (+) 0 (map (\(_=>v) -> v) (members (dict ["a"=>10,"b"=>20,"c"=>30]))) $PURE$;
+SELECT dict_sum();                      -- 60
+CREATE FUNCTION dict_get(k text) RETURNS int LANGUAGE pg_pureu AS
+$PURE$ using dict; (dict ["x"=>1,"y"=>2]) ! k $PURE$;
+SELECT dict_get('y');                   -- 2
+-- rational: utilities on math's exact rationals, e.g. a double to a fraction.
+CREATE FUNCTION rat_of(x float8) RETURNS text LANGUAGE pg_pureu AS
+$PURE$ using rational; str (rational x) $PURE$;
+SELECT rat_of(0.75);                    -- 3L%4L
+
 -- many calls of a compiled function in one statement
 SELECT sum(pmul(i, 2)) FROM generate_series(1, 100000) i;

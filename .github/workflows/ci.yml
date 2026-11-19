@@ -88,7 +88,7 @@ jobs:
           # from an older runner image can bind to a libgsl that is no longer
           # present (the gsl extern then fails to reduce). Bump the trailing
           # counter whenever the runner image's GSL/BLAS changes.
-          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-gsl2
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-mod1
 
       - name: Build libpure (and the gsl module) from the fork
         if: steps.purecache.outputs.cache-hit != 'true'
@@ -102,11 +102,15 @@ jobs:
             CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}"
           make -j"$(nproc)"
           make install
-          # Build the add-on Pure modules the test suite uses (gsl::matrix).
-          cd ../pure-gsl
+          # Build the add-on Pure modules the test suite uses. gsl provides
+          # gsl::matrix and gsl::linalg; mpfr, stldict (dict) and rational are
+          # promoted to the tested set as of 0.8.
           export PKG_CONFIG_PATH="$HOME/pure/lib/pkgconfig" PATH="$HOME/pure/bin:$PATH"
-          make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" libdir="$HOME/pure/lib"
-          make install libdir="$HOME/pure/lib"
+          for mod in gsl mpfr stldict rational; do
+            cd "$GITHUB_WORKSPACE/pure-lang/pure-$mod"
+            make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" libdir="$HOME/pure/lib"
+            make install libdir="$HOME/pure/lib"
+          done
 
       - name: Install PostgreSQL ${{ matrix.pg }} WITHOUT the JIT package
         run: |

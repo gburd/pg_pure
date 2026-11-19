@@ -4,6 +4,24 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.8.0] - 2026-11-19
+
+### Added
+- **More vetted Pure modules**, built and installed alongside libpure and
+  exercised by the regression suite: `mpfr` (arbitrary-precision floats --
+  `mpfr_set_default_prec` then compute, e.g. pi to hundreds of bits),
+  `dict` (the stldict STL-backed associative maps), and `rational`
+  (utilities on math's exact rationals, such as a double to a fraction).
+  These join `gsl`/`gsl::linalg` on the tested list. A body loads one with
+  `using mpfr;` (etc.) in the untrusted language, or the DBA allow-lists it
+  through `pg_pure.using` for the trusted language.
+
+### Notes
+- `csv`, `xml`, `stllib` and `glpk` build against the fork but are not yet on
+  the tested list: csv and xml are file/document oriented and do not map
+  cleanly to a single-expression function body, and glpk needs an ODBC
+  library and a fork-side fix to its error hook. They may be promoted later.
+
 ## [0.7.1] - 2026-11-19
 
 ### Changed

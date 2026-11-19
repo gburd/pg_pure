@@ -90,7 +90,7 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/pure
-          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-gsl2
+          key: libpure-${{ steps.pure.outputs.sha }}-llvm${{ env.LLVM_MAJOR }}-${{ runner.os }}-mod1
 
       - name: Build libpure (and the gsl module) from the fork
         if: steps.purecache.outputs.cache-hit != 'true'
@@ -101,10 +101,14 @@ jobs:
             --enable-release LLVM_CONFIG="/usr/lib/llvm-${LLVM_MAJOR}/bin/llvm-config" \
             CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}"
           make -j"$(nproc)" && make install
-          cd ../pure-gsl
+          # Build the add-on Pure modules the suite uses (0.8: gsl, mpfr,
+          # stldict, rational).
           export PKG_CONFIG_PATH="$HOME/pure/lib/pkgconfig" PATH="$HOME/pure/bin:$PATH"
-          make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" libdir="$HOME/pure/lib"
-          make install libdir="$HOME/pure/lib"
+          for mod in gsl mpfr stldict rational; do
+            cd "$GITHUB_WORKSPACE/pure-lang/pure-$mod"
+            make PIC=-fPIC CC="clang-${LLVM_MAJOR}" CXX="clang++-${LLVM_MAJOR}" libdir="$HOME/pure/lib"
+            make install libdir="$HOME/pure/lib"
+          done
 
       - name: Build + test (gate the release)
         run: |

@@ -291,8 +291,9 @@ their base type, with the CHECK enforced), `sql::query`/`sql::exec` (with
 parameters passed as Datums), set-returning functions (`RETURNS SETOF` of a
 scalar or array, from a Pure list or a body-bounded lazy stream),
 `sql::notice`/`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the
-validator, preload warm-up, the add-on Pure modules (`using gsl`, ...), and a
-compiled `gsl::linalg::cholesky_solve` SPD solve. A Nix package builds libpure
+validator, preload warm-up, the vetted add-on Pure modules (`gsl`,
+`gsl::linalg`, `mpfr`, `dict`, `rational`), and a compiled
+`gsl::linalg::cholesky_solve` SPD solve. A Nix package builds libpure
 and the modules; a TAP suite covers the JIT+Pure crash matrix, cancel,
 concurrency and bounded memory. PostgreSQL 17/18/19 pass both regression
 suites with `jit=on` and zero crashes.
