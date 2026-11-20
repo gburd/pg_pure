@@ -112,8 +112,15 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
 
 ## Phase 2b: depth
 
-- [ ] 2.1 Prepared plans, either cached per query string or as an explicit
-      `sql::prepare`.
+- [x] 2.1 Prepared plans (0.9): a transparent per-backend plan cache for
+      `sql::query` / `sql::exec`. A parameterized query repeated with the
+      same text and parameter types is planned once and reused; the key
+      includes the inferred parameter type Oids (so int and double uses of
+      one text get separate correct plans), and the saved plan relies on
+      PostgreSQL's own revalidation for search_path / role / DDL changes.
+      No `sql::prepare` handle: a raw plan handle returned to Pure would
+      dangle once the cache evicts it, and the transparent cache needs no
+      API.
 - [ ] 2.2 `sql::stream q`: a lazy stream backed by a cursor. Forcing it
       after its call has returned must throw, never crash.
 - [x] 2.3 bytea and domains (0.7). bytea maps to a Pure int matrix of byte

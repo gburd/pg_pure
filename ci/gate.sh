@@ -1,7 +1,8 @@
 #!/bin/sh
 # ci/gate.sh -- the full local test gate for pg_pure: the regression suites
 # (pg_pureu, pg_pure) and the TAP suite (t/*.pl: the JIT+Pure crash matrix,
-# cancel/terminate, concurrency, and bounded-memory checks). Every new TAP
+# cancel/terminate, concurrency, bounded-memory, and SPI plan-cache checks).
+# Every new TAP
 # test is added here (AGENTS.md).
 #
 # Usage:

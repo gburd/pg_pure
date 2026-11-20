@@ -4,6 +4,21 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.9.0] - 2026-11-20
+
+### Added
+- **A plan cache for `sql::query` / `sql::exec`.** A parameterized query
+  repeated with the same text and the same parameter types -- the common
+  case of a query in a loop, or the same function called many times -- is now
+  planned once and the saved plan is reused, instead of re-planning every
+  call. The cache is transparent: no API change, no new Pure syntax. The
+  cache key is the query text plus the inferred parameter type Oids, so the
+  same text used with an int parameter and with a double parameter gets its
+  own correct plan. PostgreSQL's plan cache revalidates a saved plan on its
+  own when a referenced object, the search path, or the current role changes,
+  so a cached plan never returns a stale answer. The cache holds up to 128
+  plans per backend and evicts the least recently used.
+
 ## [0.8.0] - 2026-11-19
 
 ### Added

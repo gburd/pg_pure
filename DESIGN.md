@@ -201,6 +201,17 @@ not, the original error is re-raised with its detail, hint and position
 intact. Any other uncaught Pure exception becomes `ERROR: pl_pure_untrusted: uncaught
 exception: <value>` with SQLSTATE 38000.
 
+A parameterized query is planned once and its plan reused across calls. The
+saved plan is cached per backend, keyed by the query text and the inferred
+parameter type Oids. The types are part of the key on purpose: the same text
+used with an int parameter and with a double parameter needs, and gets,
+different plans, so a cached plan never returns a wrong answer for a
+differently-typed call. The plan is saved with `SPI_keepplan`, so it outlives
+the per-call SPI connection and the internal subtransaction, and PostgreSQL's
+plan cache revalidates it on its own when a referenced object, the search
+path or the current role changes. The cache holds a bounded number of plans
+and evicts the least recently used.
+
 ### 2.5 Triggers
 
 ```sql

@@ -53,6 +53,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/hsearch.h"
 #include "utils/numeric.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
@@ -256,6 +257,130 @@ pure_param_to_datum(pure_expr *x, Oid *type, Datum *value, char *nul)
 				 errmsg("pg_pure query parameter does not fit its inferred type")));
 }
 
+/* --- SPI plan cache ---------------------------------------------------- */
+
+/*
+ * A repeated query (the same text and the same inferred parameter types,
+ * e.g. a sql::query called in a loop) is planned once and the saved plan is
+ * reused. SPI_keepplan moves the plan into CacheMemoryContext, so it outlives
+ * the per-call SPI_connect/SPI_finish and the internal subtransaction each
+ * query runs in. PostgreSQL's plan cache revalidates a saved plan on its own
+ * when search_path, the current role, or a referenced object changes, so the
+ * cache key is only the query text and the parameter type Oids: the same text
+ * with int parameters and with double parameters needs, and gets, different
+ * plans.
+ */
+#define PG_PURE_PLAN_CACHE_MAX	128
+
+typedef struct PlanCacheEntry
+{
+	char		key[NAMEDATALEN * 4];	/* argcount:oids:sql, truncated to fit */
+	SPIPlanPtr	plan;
+	uint64		last_used;
+} PlanCacheEntry;
+
+static HTAB *plan_cache = NULL;
+static uint64 plan_cache_clock = 0;
+
+/*
+ * Build the cache key for a query: the parameter count, the parameter type
+ * Oids, then the SQL text. Including the Oids keeps differently-typed uses of
+ * the same text in separate entries, which is a correctness requirement, not
+ * an optimization. Returns false if the key would not fit the fixed buffer
+ * (a very long query); the caller then skips the cache and plans inline.
+ */
+static bool
+plan_cache_key(char *buf, size_t buflen, const char *sql, int nargs,
+			   const Oid *argtypes)
+{
+	StringInfoData k;
+	bool		fits;
+
+	initStringInfo(&k);
+	appendStringInfo(&k, "%d:", nargs);
+	for (int i = 0; i < nargs; i++)
+		appendStringInfo(&k, "%u,", argtypes[i]);
+	appendStringInfoChar(&k, ':');
+	appendStringInfoString(&k, sql);
+	fits = (k.len < (int) buflen);
+	if (fits)
+		memcpy(buf, k.data, k.len + 1);
+	pfree(k.data);
+	return fits;
+}
+
+/*
+ * Return a saved SPI plan for (sql, argtypes), preparing and caching it on a
+ * miss. Returns NULL only if the key does not fit (caller plans inline) or if
+ * SPI_prepare fails (caller falls through to the normal error path). A plan
+ * is inserted only after both SPI_prepare and SPI_keepplan succeed, so an
+ * error never leaves a half-built entry. Must run with SPI connected.
+ */
+static SPIPlanPtr
+spi_cached_plan(const char *sql, int nargs, Oid *argtypes)
+{
+	char		key[NAMEDATALEN * 4];
+	PlanCacheEntry *entry;
+	bool		found;
+	SPIPlanPtr	plan;
+
+	if (!plan_cache_key(key, sizeof key, sql, nargs, argtypes))
+		return NULL;			/* too long to key; plan inline */
+
+	if (plan_cache == NULL)
+	{
+		HASHCTL		ctl;
+
+		memset(&ctl, 0, sizeof ctl);
+		ctl.keysize = sizeof ((PlanCacheEntry *) 0)->key;
+		ctl.entrysize = sizeof(PlanCacheEntry);
+		ctl.hcxt = TopMemoryContext;
+		plan_cache = hash_create("pg_pure SPI plans", 32, &ctl,
+								 HASH_ELEM | HASH_STRINGS | HASH_CONTEXT);
+	}
+
+	entry = hash_search(plan_cache, key, HASH_FIND, &found);
+	if (found)
+	{
+		entry->last_used = ++plan_cache_clock;
+		return entry->plan;
+	}
+
+	/* Miss: plan it. A failure here leaves the cache untouched. */
+	plan = SPI_prepare(sql, nargs, argtypes);
+	if (plan == NULL)
+		return NULL;
+	if (SPI_keepplan(plan) != 0)
+		return NULL;			/* could not save; plan not cached */
+
+	/* Evict the least-recently-used entry if the cache is full. */
+	if (hash_get_num_entries(plan_cache) >= PG_PURE_PLAN_CACHE_MAX)
+	{
+		HASH_SEQ_STATUS seq;
+		PlanCacheEntry *e;
+		PlanCacheEntry *victim = NULL;
+
+		hash_seq_init(&seq, plan_cache);
+		while ((e = hash_seq_search(&seq)) != NULL)
+			if (victim == NULL || e->last_used < victim->last_used)
+				victim = e;
+		if (victim)
+		{
+			SPIPlanPtr	vp = victim->plan;
+			char		vkey[NAMEDATALEN * 4];
+
+			memcpy(vkey, victim->key, sizeof vkey);
+			hash_search(plan_cache, vkey, HASH_REMOVE, NULL);
+			SPI_freeplan(vp);
+		}
+	}
+
+	entry = hash_search(plan_cache, key, HASH_ENTER, &found);
+	entry->plan = plan;
+	entry->last_used = ++plan_cache_clock;
+	return plan;
+}
+
 static pure_expr *
 spi_run(const char *sql, bool want_rows, pure_expr *params)
 {
@@ -284,11 +409,17 @@ spi_run(const char *sql, bool want_rows, pure_expr *params)
 			Oid		   *argtypes = palloc(sizeof(Oid) * np);
 			Datum	   *values = palloc(sizeof(Datum) * np);
 			char	   *nulls = palloc(np);
+			SPIPlanPtr	plan;
 
 			for (size_t i = 0; i < np; i++)
 				pure_param_to_datum(pe[i], &argtypes[i], &values[i], &nulls[i]);
-			rc = SPI_execute_with_args(sql, (int) np, argtypes, values,
-									   nulls, false, 0);
+			/* Reuse a saved plan when the text and parameter types repeat. */
+			plan = spi_cached_plan(sql, (int) np, argtypes);
+			if (plan)
+				rc = SPI_execute_plan(plan, values, nulls, false, 0);
+			else
+				rc = SPI_execute_with_args(sql, (int) np, argtypes, values,
+										   nulls, false, 0);
 		}
 		if (pe)
 			free(pe);
