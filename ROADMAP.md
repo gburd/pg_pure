@@ -121,8 +121,14 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
       No `sql::prepare` handle: a raw plan handle returned to Pure would
       dangle once the cache evicts it, and the transparent cache needs no
       API.
-- [ ] 2.2 `sql::stream q`: a lazy stream backed by a cursor. Forcing it
-      after its call has returned must throw, never crash.
+- [x] 2.2 `sql::stream q` (0.10): a lazy, cursor-backed result. It returns an
+      ordinary Pure lazy list fetched from an SPI cursor in batches, so a body
+      can reduce or take from a large result without materializing it. The
+      stream is scoped to the function call that opened it: the call closes
+      its cursors and bumps an epoch before disconnecting SPI, so a stream
+      forced after the call returned finds the cursor gone by name and throws
+      `sql::error` rather than touching freed memory. A holdable cursor that
+      outlives the call (streaming to a later statement) is deferred.
 - [x] 2.3 bytea and domains (0.7). bytea maps to a Pure int matrix of byte
       values (arbitrary binary, embedded NUL, out-of-range element is an
       error); a domain is accepted as its base type with its CHECK enforced

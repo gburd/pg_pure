@@ -4,6 +4,27 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.10.0] - 2026-11-23
+
+### Added
+- **`sql::stream`** -- a lazy, cursor-backed result. `sql::stream q` and
+  `sql::stream (q, [params])` return a Pure list that fetches rows from an
+  SPI cursor in batches as the list is consumed, so a body can process or
+  reduce a large result without materializing all of it. The value is an
+  ordinary lazy Pure list, so every list operation works: `foldl (+) 0
+  (sql::stream "...")`, `take 3 (sql::stream "...")`, a comprehension, or a
+  `head:tail` match.
+- A stream is valid only within the function call that opened it. When the
+  call returns, pg_pure closes the cursor; a stream value forced after that
+  (for example one a body tried to hand back) raises a `sql::error`, and the
+  backend survives -- it never touches the dropped cursor. Each force finds
+  the cursor fresh by name and checks a per-call epoch, so there is no stored
+  pointer to dangle.
+
+### Notes
+- Streaming a result to a *later* SQL statement (a holdable cursor that
+  outlives the function call) is deferred; 0.10.0 streams are call-scoped.
+
 ## [0.9.0] - 2026-11-20
 
 ### Added

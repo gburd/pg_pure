@@ -55,6 +55,7 @@
 #include "utils/memutils.h"
 #include "utils/hsearch.h"
 #include "utils/numeric.h"
+#include "utils/portal.h"
 #include "utils/resowner.h"
 #include "utils/syscache.h"
 #include "utils/tuplestore.h"
@@ -95,6 +96,30 @@ static char *pg_pure_using = NULL;
  */
 static pure_interp *interp_untrusted = NULL;
 static pure_interp *interp_trusted = NULL;
+
+/*
+ * A cursor-backed stream is valid only within the pg_pure function call that
+ * created it. Each call_function bumps spi_epoch on the way out (and closes
+ * the call's cursors), so a stream forced after its call returned finds a
+ * stale epoch and throws rather than touching a dropped portal. spi_active is
+ * true only between the call's SPI_connect and SPI_finish.
+ */
+static uint64 spi_epoch = 0;
+static bool spi_active = false;
+
+#define PG_PURE_MAX_STREAMS		64
+#define PG_PURE_STREAM_BATCH	64
+
+typedef struct StreamState
+{
+	bool		in_use;
+	uint64		epoch;			/* the call epoch this cursor belongs to */
+	char		portal[64];		/* cursor name; the Portal is found by name */
+	bool		done;			/* the cursor reached end */
+} StreamState;
+
+static StreamState streams[PG_PURE_MAX_STREAMS];
+
 static int32_t sym_sql_null = 0;
 static int32_t sym_sql_error = 0;
 
@@ -381,6 +406,38 @@ spi_cached_plan(const char *sql, int nargs, Oid *argtypes)
 	return plan;
 }
 
+/*
+ * Convert the current SPI_tuptable's first n rows to a Pure list: a one-column
+ * row is the bare value, a multi-column row a tuple. Shared by sql::query
+ * (whole result) and sql::stream (one fetched batch).
+ */
+static pure_expr *
+spi_tuptable_to_list(uint64 n)
+{
+	pure_expr **rows = palloc(sizeof(pure_expr *) * (n ? n : 1));
+	TupleDesc	td = SPI_tuptable ? SPI_tuptable->tupdesc : NULL;
+	pure_expr  *result;
+
+	for (uint64 i = 0; i < n; i++)
+	{
+		int			nc = td->natts;
+		pure_expr **cols = palloc(sizeof(pure_expr *) * nc);
+
+		for (int c = 0; c < nc; c++)
+		{
+			bool		isnull;
+			Datum		dv = SPI_getbinval(SPI_tuptable->vals[i], td, c + 1, &isnull);
+
+			cols[c] = datum_to_pure(dv, isnull, TupleDescAttr(td, c)->atttypid);
+		}
+		rows[i] = nc == 1 ? cols[0] : pure_tuplev(nc, cols);
+		pfree(cols);
+	}
+	result = pure_listv(n, rows);
+	pfree(rows);
+	return result;
+}
+
 static pure_expr *
 spi_run(const char *sql, bool want_rows, pure_expr *params)
 {
@@ -429,29 +486,7 @@ spi_run(const char *sql, bool want_rows, pure_expr *params)
 		if (!want_rows)
 			result = pure_int64((int64_t) SPI_processed);
 		else
-		{
-			uint64		n = SPI_processed;
-			pure_expr **rows = palloc(sizeof(pure_expr *) * (n ? n : 1));
-			TupleDesc	td = SPI_tuptable ? SPI_tuptable->tupdesc : NULL;
-
-			for (uint64 i = 0; i < n; i++)
-			{
-				int			nc = td->natts;
-				pure_expr **cols = palloc(sizeof(pure_expr *) * nc);
-
-				for (int c = 0; c < nc; c++)
-				{
-					bool		isnull;
-					Datum		dv = SPI_getbinval(SPI_tuptable->vals[i], td, c + 1, &isnull);
-
-					cols[c] = datum_to_pure(dv, isnull, TupleDescAttr(td, c)->atttypid);
-				}
-				rows[i] = nc == 1 ? cols[0] : pure_tuplev(nc, cols);
-				pfree(cols);
-			}
-			result = pure_listv(n, rows);
-			pfree(rows);
-		}
+			result = spi_tuptable_to_list(SPI_processed);
 		ReleaseCurrentSubTransaction();
 		MemoryContextSwitchTo(oldcxt);
 		CurrentResourceOwner = oldowner;
@@ -503,6 +538,8 @@ PGDLLEXPORT pure_expr *pg_pure_spi_query_p(const char *sql, pure_expr *params);
 PGDLLEXPORT pure_expr *pg_pure_spi_exec_p(const char *sql, pure_expr *params);
 PGDLLEXPORT void pg_pure_notice(const char *msg);
 PGDLLEXPORT void pg_pure_warning(const char *msg);
+PGDLLEXPORT pure_expr *pg_pure_spi_stream_open(const char *sql, pure_expr *params);
+PGDLLEXPORT pure_expr *pg_pure_spi_stream_fetch(int32_t handle);
 
 pure_expr *
 pg_pure_spi_query(const char *sql)
@@ -538,6 +575,167 @@ void
 pg_pure_warning(const char *msg)
 {
 	ereport(WARNING, (errmsg_internal("%s", msg ? msg : "")));
+}
+
+/*
+ * Mark the start of a function call's SPI session. Streams opened during the
+ * call are valid only until spi_call_end bumps the epoch.
+ */
+static void
+spi_call_begin(void)
+{
+	spi_active = true;
+}
+
+/*
+ * End a function call's SPI session: close any cursors it opened and bump the
+ * epoch so an outstanding stream handle forced later fails its epoch check and
+ * throws rather than touching a dropped portal. Call immediately before
+ * SPI_finish, while SPI is still connected (SPI_cursor_close needs it).
+ */
+static void
+spi_call_end(void)
+{
+	for (int i = 0; i < PG_PURE_MAX_STREAMS; i++)
+	{
+		if (streams[i].in_use)
+		{
+			Portal		p = SPI_cursor_find(streams[i].portal);
+
+			if (p != NULL && PortalIsValid(p))
+				SPI_cursor_close(p);
+			streams[i].in_use = false;
+		}
+	}
+	spi_active = false;
+	spi_epoch++;
+}
+
+/*
+ * Throw a Pure sql::error exception directly (no ereport, nothing to unwind on
+ * the PostgreSQL side). Used by the stream fetch when its cursor is no longer
+ * valid: this unwinds Pure frames, it does not longjmp through them. Does not
+ * return.
+ */
+static void
+throw_sql_error(const char *sqlstate, const char *msg)
+{
+	pure_expr  *e = pure_symbol(sym_sql_error);
+
+	e = pure_app(e, pure_cstring_dup(sqlstate));
+	e = pure_app(e, pure_cstring_dup(msg));
+	pure_throw(e);
+	pg_unreachable();
+}
+
+/*
+ * sql::stream opens a cursor and hands back a small integer handle into the
+ * per-call stream registry. The lazy Pure wrapper (see the interpreter setup)
+ * drives it with pg_pure_spi_stream_fetch. The cursor is valid only for this
+ * function call: call_function closes it and bumps spi_epoch before
+ * SPI_finish, so a handle forced after the call returned fails the epoch check
+ * in fetch and throws. Returns the handle as a Pure int.
+ */
+pure_expr *
+pg_pure_spi_stream_open(const char *sql, pure_expr *params)
+{
+	int			slot;
+	size_t		np = 0;
+	pure_expr **pe = NULL;
+	SPIPlanPtr	plan;
+	Oid		   *argtypes = NULL;
+	Datum	   *values = NULL;
+	char	   *nulls = NULL;
+	Portal		portal;
+
+	if (params && !pure_is_listv(params, &np, &pe))
+		throw_sql_error("42804", "pg_pure stream parameters must be a list");
+
+	for (slot = 0; slot < PG_PURE_MAX_STREAMS; slot++)
+		if (!streams[slot].in_use)
+			break;
+	if (slot == PG_PURE_MAX_STREAMS)
+	{
+		if (pe)
+			free(pe);
+		throw_sql_error("53400", "too many open pg_pure streams");
+	}
+
+	if (np > 0)
+	{
+		argtypes = palloc(sizeof(Oid) * np);
+		values = palloc(sizeof(Datum) * np);
+		nulls = palloc(np);
+		for (size_t i = 0; i < np; i++)
+			pure_param_to_datum(pe[i], &argtypes[i], &values[i], &nulls[i]);
+	}
+	if (pe)
+		free(pe);
+
+	/*
+	 * Open the cursor at the SPI-connection level (not inside a per-query
+	 * subtransaction), so it lives for the whole function call. A saved plan
+	 * from the cache backs it. SPI rejects a non-SELECT as a cursor.
+	 */
+	plan = spi_cached_plan(sql, (int) np, argtypes);
+	if (plan == NULL)
+	{
+		plan = SPI_prepare(sql, (int) np, argtypes);
+		if (plan == NULL)
+			throw_sql_error("42601",
+							psprintf("pg_pure stream: %s",
+									 SPI_result_code_string(SPI_result)));
+	}
+	snprintf(streams[slot].portal, sizeof streams[slot].portal,
+			 "pgpure_stream_%d_%d", MyProcPid, slot);
+	portal = SPI_cursor_open(streams[slot].portal, plan, values, nulls, false);
+	if (portal == NULL)
+		throw_sql_error("34000", "pg_pure stream: could not open the cursor");
+
+	streams[slot].in_use = true;
+	streams[slot].epoch = spi_epoch;
+	streams[slot].done = false;
+	return pure_int(slot);
+}
+
+/*
+ * Fetch the next batch of a stream and return it as a Pure list, or [] at the
+ * end. The safety checks run first and throw a Pure sql::error if the cursor
+ * is no longer usable (the call that opened it has returned, so the portal was
+ * dropped): the portal is found fresh by name, never from a stored pointer, so
+ * a force after the call cannot touch freed memory.
+ */
+pure_expr *
+pg_pure_spi_stream_fetch(int32_t handle)
+{
+	StreamState *s;
+	Portal		portal;
+	pure_expr  *rows;
+
+	if (handle < 0 || handle >= PG_PURE_MAX_STREAMS || !streams[handle].in_use)
+		throw_sql_error("34000", "pg_pure stream: invalid handle");
+	s = &streams[handle];
+
+	/* The call that opened the cursor has ended: the portal is gone. */
+	if (s->epoch != spi_epoch || !spi_active)
+		throw_sql_error("55000",
+						"pg_pure stream used after its function returned");
+	if (s->done)
+		return pure_listv(0, NULL);
+
+	/* Find the portal fresh by name; never dereference a stored pointer. */
+	portal = SPI_cursor_find(s->portal);
+	if (portal == NULL || !PortalIsValid(portal))
+		throw_sql_error("34000", "pg_pure stream: the cursor is no longer open");
+
+	SPI_cursor_fetch(portal, true, PG_PURE_STREAM_BATCH);
+	if (SPI_processed == 0)
+	{
+		s->done = true;
+		return pure_listv(0, NULL);
+	}
+	rows = spi_tuptable_to_list(SPI_processed);
+	return rows;
 }
 
 /* --- type mapping ------------------------------------------------------ */
@@ -1242,6 +1440,14 @@ ensure_interp(bool trusted)
 						   "query q::string = query_ q;\n"
 						   "exec (q::string, ps::list) = exec_p q ps;\n"
 						   "exec q::string = exec_ q;\n"
+						   "extern expr* pg_pure_spi_stream_open(char*, expr*) = stream_open_;\n"
+						   "extern expr* pg_pure_spi_stream_fetch(int) = stream_fetch_;\n"
+						   "stream (q::string, ps::list) = stream_go (stream_open_ q ps);\n"
+						   "stream q::string = stream_go (stream_open_ q []);\n"
+						   "stream_go h = stream_rows (stream_fetch_ h) h;\n"
+						   "stream_rows [] h = [];\n"
+						   "stream_rows [r] h = r : stream_go h &;\n"
+						   "stream_rows (r:rs) h = r : stream_rows rs h &;\n"
 						   "extern void pg_pure_notice(char*) = notice;\n"
 						   "extern void pg_pure_warning(char*) = warning;\n"
 						   "namespace;\n");
@@ -1727,11 +1933,13 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 
 	if ((rc = SPI_connect()) != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+	spi_call_begin();
 	set_stack_limit();
 	pending_pg_error = NULL;
 	res = pure_appxv(cf->fun, cf->nargs ? cf->nargs : 1, args, &exc);
 	if (!res)
 	{
+		spi_call_end();
 		SPI_finish();
 		report_pure_failure(lang, "uncaught exception", exc);
 	}
@@ -1740,6 +1948,7 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 		/* Collect the list into a tuplestore, then disconnect SPI. */
 		Datum		set = return_set(lang, fcinfo, cf, res);
 
+		spi_call_end();
 		SPI_finish();
 		return set;
 	}
@@ -1750,6 +1959,7 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 
 		free(s);
 		pure_freenew(res);
+		spi_call_end();
 		SPI_finish();
 		if (overflow)
 			ereport(ERROR,
@@ -1770,6 +1980,7 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	/* Copy a by-reference result out of SPI's memory before SPI_finish. */
 	if (!isnull && !get_typbyval(cf->rettype))
 		d = SPI_datumTransfer(d, false, get_typlen(cf->rettype));
+	spi_call_end();
 	SPI_finish();
 	fcinfo->isnull = isnull;
 	return d;
@@ -1859,6 +2070,7 @@ inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 
 	if ((rc = SPI_connect()) != SPI_OK_CONNECT)
 		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+	spi_call_begin();
 	pending_pg_error = NULL;
 	{
 		pure_expr  *f = pure_symbol(pure_sym("__pg_pure_do"));
@@ -1870,10 +2082,12 @@ inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	free(out);
 	if (!res)
 	{
+		spi_call_end();
 		SPI_finish();
 		report_pure_failure(lang, "uncaught exception in DO block", exc);
 	}
 	pure_freenew(res);
+	spi_call_end();
 	SPI_finish();
 	PG_RETURN_VOID();
 }

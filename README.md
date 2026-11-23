@@ -283,12 +283,13 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.9, in development. Working: both languages (`pg_pure` trusted via libpure
+0.10, in development. Working: both languages (`pg_pure` trusted via libpure
 safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
 float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
 `float8[]` <-> Pure double matrix, `bytea` <-> Pure byte matrix, domains (as
 their base type, with the CHECK enforced), `sql::query`/`sql::exec` (with
-parameters passed as Datums and a transparent plan cache), set-returning functions (`RETURNS SETOF` of a
+parameters passed as Datums and a transparent plan cache), `sql::stream` (a
+lazy cursor-backed result), set-returning functions (`RETURNS SETOF` of a
 scalar or array, from a Pure list or a body-bounded lazy stream),
 `sql::notice`/`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the
 validator, preload warm-up, the vetted add-on Pure modules (`gsl`,

@@ -212,6 +212,19 @@ plan cache revalidates it on its own when a referenced object, the search
 path or the current role changes. The cache holds a bounded number of plans
 and evicts the least recently used.
 
+`sql::stream q` (and `sql::stream (q, params)`) is the lazy counterpart of
+`sql::query`: it opens an SPI cursor and returns an ordinary Pure lazy list
+that fetches the next batch of rows each time the list is forced further, so a
+body can reduce or take from a large result without building the whole list.
+The cursor is valid only for the duration of the function call that opened it:
+the call closes its cursors and advances an epoch counter before it
+disconnects SPI. A stream value forced after the call has returned (one a body
+tried to leak) therefore finds a stale epoch or a closed cursor and raises
+`sql::error`; it never dereferences the dropped portal. Each force locates the
+cursor by name, so there is no stored portal pointer that could dangle. A
+holdable cursor that outlives the call is future work; today a stream is
+scoped to its call.
+
 ### 2.5 Triggers
 
 ```sql
