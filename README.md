@@ -345,9 +345,12 @@ per-SQL-user trusted interpreters, and a curated safe-mode prelude. See
 
 ## Documentation
 
+- The HTML reference manual: https://gburd.github.io/pg_pure/ (built from
+  `doc/pg_pure.sgml`).
 - `DESIGN.md` — the full design, the measurements, and the LLVM coexistence
   analysis.
 - `ROADMAP.md` — the phased plan and what is done.
+- `bench/` - the benchmark harness, method and measured results.
 
 ## License
 
