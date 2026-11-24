@@ -227,10 +227,13 @@ scoped to its call.
 
 ### 2.5 Triggers
 
+Implemented in 0.11: DML triggers (BEFORE/AFTER, ROW/STATEMENT, on
+INSERT/UPDATE/DELETE, and TRUNCATE).
+
 ```sql
-CREATE FUNCTION line_total() RETURNS trigger LANGUAGE pl_pure_untrusted AS $$
+CREATE FUNCTION line_total() RETURNS trigger LANGUAGE pg_pureu AS $PURE$
   insert new ("total" => new!"qty" * new!"price")
-$$;
+$PURE$;
 CREATE TRIGGER line_total BEFORE INSERT OR UPDATE ON line_item
   FOR EACH ROW EXECUTE FUNCTION line_total();
 ```
@@ -238,13 +241,18 @@ CREATE TRIGGER line_total BEFORE INSERT OR UPDATE ON line_item
 A trigger body sees three variables:
 
 - `new` and `old` are records, or `sql::null` when the operation has none.
+  For INSERT, `new` is the row and `old` is `sql::null`; for DELETE, `old`
+  is the row and `new` is `sql::null`; for UPDATE, `new` is the new row and
+  `old` the pre-update row.
 - `tg` is a record with the keys "name", "when", "level", "op",
   "table_name", "table_schema" and "args".
 
-In a row-level BEFORE trigger, returning a record makes it the row, and
-returning `sql::null` skips the operation, which is PostgreSQL's own rule
-(returning NULL means skip). PostgreSQL ignores the return value of
-statement-level and AFTER triggers.
+In a row-level BEFORE trigger, returning a record makes it the stored row,
+and returning `sql::null` skips the operation, which is PostgreSQL's own rule
+(returning NULL means skip). A returned record overrides only the columns it
+names; columns it omits keep the row's original value (as PL/Python does), so
+a body need not echo every column. PostgreSQL ignores the return value of
+statement-level and AFTER triggers. Event triggers remain unsupported.
 
 ### 2.6 DO blocks and procedures
 

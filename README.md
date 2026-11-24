@@ -142,6 +142,24 @@ parameter's SQL type is inferred from the Pure value (int, double, string,
 bigint, or `sql::null`). The no-parameter forms `sql::query q` and
 `sql::exec q` still work.
 
+Triggers. A `RETURNS trigger` function sees `new` and `old` (row records, or
+`sql::null` when the event has none) and `tg` (a record describing the event,
+with keys like "op", "when", "level" and "table_name"). A BEFORE-row body
+returns a record to become the stored row, overriding only the columns it
+names, or `sql::null` to skip the row:
+
+```sql
+CREATE FUNCTION fill_total() RETURNS trigger LANGUAGE pg_pureu AS $PURE$
+  insert new ("total" => new!"qty" * new!"price")
+$PURE$;
+CREATE TRIGGER t_total BEFORE INSERT OR UPDATE ON line_item
+  FOR EACH ROW EXECUTE FUNCTION fill_total();
+```
+
+The body overrides only `total`; the other columns keep the values the
+statement supplied. Returning `sql::null` from a BEFORE-row trigger skips the
+operation. AFTER and statement triggers ignore the return value.
+
 ## Requirements
 
 - PostgreSQL **17, 18, or 19**. All three build and pass the regression suite,
@@ -283,7 +301,7 @@ way, since the interpreter is per-backend.
 
 ## Status
 
-0.10, in development. Working: both languages (`pg_pure` trusted via libpure
+0.11, in development. Working: both languages (`pg_pure` trusted via libpure
 safe mode, `pg_pureu` untrusted), scalar functions over int2/int4/int8/
 float4/float8/numeric/bool/text, exact numeric, NULL as `sql::null`,
 `float8[]` <-> Pure double matrix, `bytea` <-> Pure byte matrix, domains (as
@@ -291,7 +309,9 @@ their base type, with the CHECK enforced), `sql::query`/`sql::exec` (with
 parameters passed as Datums and a transparent plan cache), `sql::stream` (a
 lazy cursor-backed result), set-returning functions (`RETURNS SETOF` of a
 scalar or array, from a Pure list or a body-bounded lazy stream),
-`sql::notice`/`sql::warning`, SQL-error-as-`sql::error`, DO blocks, the
+`sql::notice`/`sql::warning`, SQL-error-as-`sql::error`, DO blocks, DML
+triggers (BEFORE/AFTER, ROW/STATEMENT, on INSERT/UPDATE/DELETE and TRUNCATE;
+the body sees `new`, `old` and `tg`), the
 validator, preload warm-up, the vetted add-on Pure modules (`gsl`,
 `gsl::linalg`, `mpfr`, `dict`, `rational`), and a compiled
 `gsl::linalg::cholesky_solve` SPD solve. A Nix package builds libpure
@@ -299,7 +319,7 @@ and the modules; a TAP suite covers the JIT+Pure crash matrix, cancel,
 concurrency and bounded memory. PostgreSQL 17/18/19 pass both regression
 suites with `jit=on` and zero crashes.
 
-Not yet: `RETURNS TABLE` / SETOF composite, triggers, composite types,
+Not yet: `RETURNS TABLE` / SETOF composite, event triggers, composite types,
 per-SQL-user trusted interpreters, and a curated safe-mode prelude. See
 `ROADMAP.md`.
 

@@ -163,6 +163,12 @@ Gate: phase 1 gate, plus the module tests and the property suite.
       a native or off-allowlist `using`, or a dangerous prelude function is
       refused as an SQL ERROR and the backend survives. `sql/pg_pure.sql`
       covers each route; passes on PG 17/18/19.
+- [x] 3.4a DML triggers (0.11, DESIGN.md 2.5): BEFORE/AFTER, ROW/STATEMENT,
+      on INSERT/UPDATE/DELETE, and TRUNCATE. The body sees `new`, `old` and
+      `tg`; a BEFORE-row body returns a record (overriding only the columns it
+      names) or `sql::null` to skip. `t/007_triggers.pl` covers the behavior
+      and the error paths (bad return, unknown column, escape guard); passes
+      on PG 17/18/19 with zero crashes.
 - [ ] 3.3b One interpreter per SQL user (DESIGN.md 9.4): deferred as defense
       in depth, not a fix for a present hole. The state-leak channel it was
       meant to close (a body defining a top-level rule that another function
@@ -177,7 +183,8 @@ Gate: phase 1 gate, plus the module tests and the property suite.
       designed with the Pure maintainer; independent security review before
       relying on the trusted language for untrusted multi-tenant use.
 - [ ] 3.4 Event triggers; transaction control in procedures (`sql::commit`,
-      `sql::rollback`).
+      `sql::rollback`). DML triggers landed in 0.11 (3.4a above); event
+      triggers and procedure transaction control remain.
 
 Gate: phase 2 gate plus the escape suite (have it in `sql/pg_pure.sql`), and
 an independent security review of the safe mode before relying on `pg_pure`

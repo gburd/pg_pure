@@ -4,6 +4,34 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.11.0] - 2026-11-23
+
+### Added
+- **DML triggers.** A `RETURNS trigger` function can now back a trigger:
+  BEFORE or AFTER, ROW or STATEMENT, on INSERT, UPDATE or DELETE (and
+  TRUNCATE). The body sees three variables: `new` and `old` (the row
+  records, or `sql::null` when the event has no such row) and `tg` (a record
+  describing the event, with the keys "name", "when", "level", "op",
+  "table_name", "table_schema" and "args"). For INSERT, `new` is the row and
+  `old` is `sql::null`; for DELETE, `old` is the row and `new` is `sql::null`;
+  for UPDATE, `new` is the new row and `old` the pre-update row.
+- A BEFORE-row trigger body returns a record to become the stored row, or
+  `sql::null` to skip the operation (PostgreSQL's own convention). A returned
+  record overrides only the columns it names; columns it omits keep the row's
+  original value, as PL/Python does, so a body need not echo every column.
+  AFTER and statement triggers ignore the return value.
+- `t/007_triggers.pl`: 12 tests covering each timing and operation, the
+  skip-via-`sql::null` path, `tg`, and the error paths (a non-record return,
+  an unknown column, and the single-expression escape guard), each asserting
+  the backend survives. Passes on PostgreSQL 17, 18 and 19 with zero crashes.
+
+### Notes
+- The trigger wrapper builds `new`, `old` and `tg` through C externs it calls
+  during evaluation, because libpure's compound-value constructors
+  (`pure_app`, lists, tuples, records) require an active evaluation frame;
+  building them in C before the call aborts the backend. Event triggers and
+  procedure transaction control remain unsupported.
+
 ## [0.10.0] - 2026-11-23
 
 ### Added

@@ -80,6 +80,7 @@ PG_FUNCTION_INFO_V1(pg_pureu_validator);
 void		_PG_init(void);
 
 static Datum call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo);
+static Datum call_trigger(const char *lang, bool trusted, FunctionCallInfo fcinfo);
 static Datum inline_block(const char *lang, bool trusted, FunctionCallInfo fcinfo);
 static void validate_function(const char *lang, bool trusted, Oid fn_oid, FunctionCallInfo fcinfo);
 
@@ -120,6 +121,15 @@ typedef struct StreamState
 
 static StreamState streams[PG_PURE_MAX_STREAMS];
 
+/*
+ * The trigger currently firing in this backend, or NULL. Set by call_trigger
+ * for the duration of the body's evaluation; the pg_pure_trig_* externs read
+ * it to build new, old and tg inside the body's Pure evaluation frame (where
+ * compound-value construction is legal). Triggers do not nest within one Pure
+ * call, so a single slot suffices.
+ */
+static TriggerData *current_trigdata = NULL;
+
 static int32_t sym_sql_null = 0;
 static int32_t sym_sql_error = 0;
 
@@ -134,6 +144,7 @@ typedef struct CachedFunc
 	Oid			argtypes[FUNC_MAX_ARGS];
 	Oid			rettype;
 	bool		retset;			/* RETURNS SETOF: the body yields a list */
+	bool		istrigger;		/* compiled as a trigger (new old tg params) */
 	void	   *domain_extra;	/* cached domain constraints, if rettype is one */
 	MemoryContext domain_cxt;	/* context domain_extra lives in */
 	struct CachedFunc *next;
@@ -146,6 +157,7 @@ static ErrorData *pending_pg_error = NULL;
 
 static pure_expr *datum_to_pure(Datum d, bool isnull, Oid type);
 static bool pure_to_datum(pure_expr *x, Oid type, Datum *d, bool *isnull, bool *overflow);
+static void throw_sql_error(const char *sqlstate, const char *msg);
 static pure_interp *ensure_interp(bool trusted);
 
 /* --- cooperative cancel ------------------------------------------------ */
@@ -438,6 +450,147 @@ spi_tuptable_to_list(uint64 n)
 	return result;
 }
 
+/*
+ * Build the raw hashpair row vector for a heap tuple: one "colname"=>value
+ * per non-dropped attribute. A NULL column becomes sql::null. datum_to_pure
+ * copies by-reference values into Pure's heap, so the result does not alias
+ * the tuple. The caller (the trigger wrapper, in a Pure frame) turns this into
+ * a canonical record with the Pure record function.
+ */
+static pure_expr *
+tuple_to_pure_record(HeapTuple tuple, TupleDesc tupdesc)
+{
+	int			natts = tupdesc->natts;
+	Datum	   *values = palloc(sizeof(Datum) * natts);
+	bool	   *nulls = palloc(sizeof(bool) * natts);
+	pure_expr **pairs = palloc(sizeof(pure_expr *) * (natts ? natts : 1));
+	int			np = 0;
+	pure_expr  *vec;
+
+	heap_deform_tuple(tuple, tupdesc, values, nulls);
+	for (int i = 0; i < natts; i++)
+	{
+		Form_pg_attribute att = TupleDescAttr(tupdesc, i);
+		pure_expr  *kv[2];
+
+		if (att->attisdropped)
+			continue;
+		kv[0] = pure_cstring_dup(NameStr(att->attname));
+		kv[1] = datum_to_pure(values[i], nulls[i], att->atttypid);
+		pairs[np++] = pure_tuplev(2, kv);
+	}
+	pfree(values);
+	pfree(nulls);
+	/*
+	 * Return a frame-free list of (key, value) tuples. The compiled trigger
+	 * wrapper turns it into a canonical record (via __pg_pure_mkrec) inside
+	 * its own Pure evaluation frame; building a record here with pure_app
+	 * would assert, because this C code runs before any Pure call is active.
+	 */
+	vec = pure_listv((size_t) np, pairs);
+	pfree(pairs);
+	if (vec == NULL)
+		throw_sql_error("XX000", "pg_pure: could not build a row record");
+	return vec;
+}
+
+/*
+ * Build the heap tuple a BEFORE-row trigger returns, from the record the body
+ * returned. Starts from the original tuple (otup) and overrides only the
+ * columns the record names, as PL/Python does: a column the record omits
+ * keeps its original value, so returning a record with one changed key does
+ * not null the rest. An unknown column, a system or generated column, or a
+ * value that does not fit the column's type is a clean error, never a silent
+ * wrong row. Returns a tuple allocated in the current (upper) memory context,
+ * so call this after SPI_finish.
+ */
+static HeapTuple
+pure_record_to_tuple(pure_expr *rec, TupleDesc tupdesc, HeapTuple otup)
+{
+	int			natts = tupdesc->natts;
+	Datum	   *modvalues = palloc0(sizeof(Datum) * natts);
+	bool	   *modnulls = palloc0(sizeof(bool) * natts);
+	bool	   *modrepls = palloc0(sizeof(bool) * natts);
+	pure_expr **elems;
+	size_t		np;
+	bool		any = false;
+
+	/* rec is already a list of "key"=>value pairs (the wrapper's __pg_pure_tro
+	 * packed the returned record into one, so no Pure call is needed here).
+	 * This runs after the Pure call returned, so errors go through ereport,
+	 * not pure_throw (there is no evaluation frame to catch a Pure exception). */
+	if (!pure_is_listv(rec, &np, &elems))
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("a BEFORE row trigger must return a record or sql::null")));
+
+	for (size_t i = 0; i < np; i++)
+	{
+		pure_expr  *f1,
+				   *arrowsym,
+				   *key,
+				   *val;
+		const char *colname;
+		int			attn;
+		Form_pg_attribute att;
+		bool		isnull,
+					overflow;
+
+		/* each pair is (=>) key value */
+		if (!pure_is_app(elems[i], &f1, &val) ||
+			!pure_is_app(f1, &arrowsym, &key) ||
+			!pure_is_string(key, &colname))
+		{
+			if (elems)
+				free(elems);
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("a trigger record has a non-string key")));
+		}
+
+		attn = SPI_fnumber(tupdesc, colname);
+		if (attn == SPI_ERROR_NOATTRIBUTE)
+		{
+			if (elems)
+				free(elems);
+			ereport(ERROR,
+					(errcode(ERRCODE_UNDEFINED_COLUMN),
+					 errmsg("pg_pure: the trigger record has no column \"%s\" in the row",
+							colname)));
+		}
+		if (attn <= 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("pg_pure: cannot set system column \"%s\" from a trigger",
+							colname)));
+		att = TupleDescAttr(tupdesc, attn - 1);
+		if (att->attgenerated != '\0')
+			ereport(ERROR,
+					(errcode(ERRCODE_GENERATED_ALWAYS),
+					 errmsg("pg_pure: cannot set generated column \"%s\" from a trigger",
+							colname)));
+		if (!pure_to_datum(val, att->atttypid, &modvalues[attn - 1],
+						   &isnull, &overflow))
+		{
+			ereport(ERROR,
+					(errcode(overflow ? ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE
+							 : ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("pg_pure: trigger column \"%s\" value does not fit type %s",
+							colname, format_type_be(att->atttypid))));
+		}
+		modnulls[attn - 1] = isnull;
+		modrepls[attn - 1] = true;
+		any = true;
+	}
+	if (elems)
+		free(elems);
+
+	/* No column overridden: the row is unchanged; keep the original tuple. */
+	if (!any)
+		return otup;
+	return heap_modify_tuple(otup, tupdesc, modvalues, modnulls, modrepls);
+}
+
 static pure_expr *
 spi_run(const char *sql, bool want_rows, pure_expr *params)
 {
@@ -540,6 +693,10 @@ PGDLLEXPORT void pg_pure_notice(const char *msg);
 PGDLLEXPORT void pg_pure_warning(const char *msg);
 PGDLLEXPORT pure_expr *pg_pure_spi_stream_open(const char *sql, pure_expr *params);
 PGDLLEXPORT pure_expr *pg_pure_spi_stream_fetch(int32_t handle);
+PGDLLEXPORT pure_expr *pg_pure_trig_new(int32_t ignore);
+PGDLLEXPORT pure_expr *pg_pure_trig_old(int32_t ignore);
+PGDLLEXPORT pure_expr *pg_pure_trig_tg(int32_t ignore);
+static pure_expr *trigger_info_record(TriggerData *td);
 
 pure_expr *
 pg_pure_spi_query(const char *sql)
@@ -736,6 +893,60 @@ pg_pure_spi_stream_fetch(int32_t handle)
 	}
 	rows = spi_tuptable_to_list(SPI_processed);
 	return rows;
+}
+
+/*
+ * Trigger row/info externs. The compiled trigger wrapper calls these to bind
+ * new, old and tg, so the compound values they return are built inside the
+ * body's Pure evaluation frame (building a list or tuple needs an active
+ * frame). new and old return a list of (key, value) tuples, or sql::null when
+ * the event has no such row; tg always returns its list of fields. The
+ * wrapper canonicalizes each into a record.
+ */
+pure_expr *
+pg_pure_trig_new(int32_t ignore)
+{
+	TriggerData *td = current_trigdata;
+	HeapTuple	tup = NULL;
+
+	(void) ignore;
+	if (td && TRIGGER_FIRED_FOR_ROW(td->tg_event))
+	{
+		if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+			tup = td->tg_trigtuple;
+		else if (TRIGGER_FIRED_BY_UPDATE(td->tg_event))
+			tup = td->tg_newtuple;
+	}
+	if (!tup)
+		return pure_symbol(sym_sql_null);
+	return tuple_to_pure_record(tup, td->tg_relation->rd_att);
+}
+
+pure_expr *
+pg_pure_trig_old(int32_t ignore)
+{
+	TriggerData *td = current_trigdata;
+	HeapTuple	tup = NULL;
+
+	(void) ignore;
+	if (td && TRIGGER_FIRED_FOR_ROW(td->tg_event))
+	{
+		if (TRIGGER_FIRED_BY_UPDATE(td->tg_event) ||
+			TRIGGER_FIRED_BY_DELETE(td->tg_event))
+			tup = td->tg_trigtuple;
+	}
+	if (!tup)
+		return pure_symbol(sym_sql_null);
+	return tuple_to_pure_record(tup, td->tg_relation->rd_att);
+}
+
+pure_expr *
+pg_pure_trig_tg(int32_t ignore)
+{
+	(void) ignore;
+	if (!current_trigdata)
+		return pure_symbol(sym_sql_null);
+	return trigger_info_record(current_trigdata);
 }
 
 /* --- type mapping ------------------------------------------------------ */
@@ -1450,7 +1661,23 @@ ensure_interp(bool trusted)
 						   "stream_rows (r:rs) h = r : stream_rows rs h &;\n"
 						   "extern void pg_pure_notice(char*) = notice;\n"
 						   "extern void pg_pure_warning(char*) = warning;\n"
-						   "namespace;\n");
+						   "namespace;\n"
+						   /* Trigger helpers and externs (top level). The externs
+							* build new/old/tg inside the body's evaluation frame,
+							* where building a list or record is legal; they take a
+							* dummy int because a nullary C extern is awkward in
+							* Pure. mkrec turns a (key, value) list into a record
+							* (sql::null passes through); tro packs a record result
+							* into a list of pairs the C side reads without a Pure
+							* call. */
+						   "extern expr* pg_pure_trig_new(int) = __pg_pure_tnew;\n"
+						   "extern expr* pg_pure_trig_old(int) = __pg_pure_told;\n"
+						   "extern expr* pg_pure_trig_tg(int) = __pg_pure_ttg;\n"
+						   "__pg_pure_mkrec sql::null = sql::null;\n"
+						   "__pg_pure_mkrec lst = record {k=>v | (k,v) = lst};\n"
+						   "__pg_pure_tro sql::null = sql::null;\n"
+						   "__pg_pure_tro v = list v if recordp v;\n"
+						   "__pg_pure_tro v = v otherwise;\n");
 	x = pure_eval(setup.data);
 	pfree(setup.data);
 	if (!x && *lasterr())
@@ -1593,7 +1820,7 @@ body_escapes_expression(const char *body)
 }
 
 static CachedFunc *
-compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
+compile_function(const char *lang, pure_interp *ip, Oid fn_oid, bool istrigger)
 {
 	HeapTuple	tup;
 	Form_pg_proc proc;
@@ -1631,7 +1858,7 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 			if (argmodes[i] != PROARGMODE_IN)
 				ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 								errmsg("%s functions support only IN arguments", lang)));
-	if (!type_supported(proc->prorettype))
+	if (!istrigger && !type_supported(proc->prorettype))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("%s functions cannot return type %s",
 							   lang, format_type_be(proc->prorettype))));
@@ -1647,7 +1874,7 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 						errmsg("%s set-returning functions support only SETOF of a scalar or array type yet",
 							   lang),
 						errdetail("RETURNS TABLE(...) and SETOF composite are not yet supported.")));
-	for (int i = 0; i < nargs; i++)
+	for (int i = 0; !istrigger && i < nargs; i++)
 	{
 		if (!type_supported(argtypes[i]))
 			ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -1688,10 +1915,15 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 	}
 
 	appendStringInfoString(&def, fname);
-	for (int i = 0; i < nargs; i++)
-		appendStringInfo(&def, " %s", argnames[i]);
-	if (nargs == 0)
-		appendStringInfoString(&def, " ()");	/* a zero-arg call takes () */
+	if (istrigger)
+		appendStringInfoString(&def, " ()");	/* a nullary closure; rows come via externs */
+	else
+	{
+		for (int i = 0; i < nargs; i++)
+			appendStringInfo(&def, " %s", argnames[i]);
+		if (nargs == 0)
+			appendStringInfoString(&def, " ()");	/* a zero-arg call takes () */
+	}
 
 	/*
 	 * The body must be a single expression. Rejecting one that escapes its
@@ -1712,7 +1944,19 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 		}
 	}
 	/* Parenthesize the body so a stray ';' cannot define a global rule. */
-	appendStringInfo(&def, " = (%s);\n%s;", body, fname);
+	if (istrigger)
+		/*
+		 * Canonicalize the raw row vectors into records (new/old, or
+		 * sql::null) and the tg vector into a record, bind them as the body's
+		 * new/old/tg, then pack a record result into a list of pairs for the C
+		 * side. All of this runs inside the body's Pure evaluation frame.
+		 */
+		appendStringInfo(&def,
+						 " = __pg_pure_tro ((%s) when new = __pg_pure_mkrec (__pg_pure_tnew 0); "
+						 "old = __pg_pure_mkrec (__pg_pure_told 0); tg = __pg_pure_mkrec (__pg_pure_ttg 0) end);\n%s;",
+						 body, fname);
+	else
+		appendStringInfo(&def, " = (%s);\n%s;", body, fname);
 
 	set_stack_limit();
 	pure_switch_interp(ip);
@@ -1754,9 +1998,11 @@ compile_function(const char *lang, pure_interp *ip, Oid fn_oid)
 	cf->fn_xmin = HeapTupleHeaderGetRawXmin(tup->t_data);
 	cf->fn_tid = tup->t_self;
 	cf->fun = pure_new(fun);
-	cf->nargs = nargs;
-	memcpy(cf->argtypes, argtypes, sizeof(Oid) * nargs);
+	cf->nargs = istrigger ? 3 : nargs;
+	if (!istrigger)
+		memcpy(cf->argtypes, argtypes, sizeof(Oid) * nargs);
 	cf->rettype = proc->prorettype;
+	cf->istrigger = istrigger;
 	cf->retset = proc->proretset;
 	/* Reset the domain-constraint cache: the return type may have changed. */
 	cf->domain_extra = NULL;
@@ -1902,6 +2148,184 @@ return_set(const char *lang, FunctionCallInfo fcinfo, CachedFunc *cf,
 	return (Datum) 0;
 }
 
+/*
+ * Build the tg record describing the firing trigger: name, when, level, op,
+ * table_name, table_schema, and args (a list of the trigger's static text
+ * arguments). The field names match DESIGN section 2.5.
+ */
+static pure_expr *
+trigger_info_record(TriggerData *td)
+{
+	Trigger    *tg = td->tg_trigger;
+	pure_expr  *pairs[7];
+	pure_expr  *argl;
+	pure_expr  *vec;
+	const char *when,
+			   *level,
+			   *op;
+
+	if (TRIGGER_FIRED_BEFORE(td->tg_event))
+		when = "BEFORE";
+	else if (TRIGGER_FIRED_AFTER(td->tg_event))
+		when = "AFTER";
+	else
+		when = "INSTEAD OF";
+	level = TRIGGER_FIRED_FOR_ROW(td->tg_event) ? "ROW" : "STATEMENT";
+	if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+		op = "INSERT";
+	else if (TRIGGER_FIRED_BY_UPDATE(td->tg_event))
+		op = "UPDATE";
+	else if (TRIGGER_FIRED_BY_DELETE(td->tg_event))
+		op = "DELETE";
+	else
+		op = "TRUNCATE";
+
+	/* args: a Pure list of the trigger's static text arguments. */
+	{
+		pure_expr **av = palloc(sizeof(pure_expr *) * (tg->tgnargs ? tg->tgnargs : 1));
+
+		for (int i = 0; i < tg->tgnargs; i++)
+			av[i] = pure_cstring_dup(tg->tgargs[i]);
+		argl = pure_listv(tg->tgnargs, av);
+		pfree(av);
+	}
+	/* Each field is a (key, value) 2-tuple; the wrapper records them. */
+#define TG_PAIR(i, k, v) \
+	do { \
+		pure_expr *kv[2]; \
+		kv[0] = pure_cstring_dup(k); \
+		kv[1] = (v); \
+		pairs[i] = pure_tuplev(2, kv); \
+	} while (0)
+	TG_PAIR(0, "name", pure_cstring_dup(tg->tgname));
+	TG_PAIR(1, "when", pure_cstring_dup(when));
+	TG_PAIR(2, "level", pure_cstring_dup(level));
+	TG_PAIR(3, "op", pure_cstring_dup(op));
+	TG_PAIR(4, "table_name",
+			pure_cstring_dup(RelationGetRelationName(td->tg_relation)));
+	TG_PAIR(5, "table_schema",
+			pure_cstring_dup(get_namespace_name(RelationGetNamespace(td->tg_relation))));
+	TG_PAIR(6, "args", argl);
+#undef TG_PAIR
+
+	vec = pure_listv(7, pairs);
+	if (vec == NULL)
+		throw_sql_error("XX000", "pg_pure: could not build the trigger record");
+	return vec;
+}
+
+/*
+ * Run a trigger function. The body sees new, old and tg (see DESIGN 2.5):
+ * new/old are the row records or sql::null, tg describes the event. For a
+ * BEFORE-row trigger the return value becomes the stored row: a record (built
+ * from the original row plus the record's overrides), or sql::null to skip the
+ * operation. AFTER and statement triggers ignore the return. The returned
+ * tuple is built after SPI_finish, in the upper memory context, so it survives
+ * for the executor to store.
+ */
+static Datum
+call_trigger(const char *lang, bool trusted, FunctionCallInfo fcinfo)
+{
+	TriggerData *td = (TriggerData *) fcinfo->context;
+	TupleDesc	tupdesc = td->tg_relation->rd_att;
+	bool		is_row = TRIGGER_FIRED_FOR_ROW(td->tg_event);
+	bool		is_before = TRIGGER_FIRED_BEFORE(td->tg_event);
+	TriggerData *saved_td = current_trigdata;
+	pure_interp *ip;
+	CachedFunc *cf;
+	pure_expr  *args[1];
+	pure_expr  *res,
+			   *exc = NULL;
+	HeapTuple	newtup = NULL;
+	int			rc;
+	int32_t		sym;
+	bool		ret_isnull;
+	HeapTuple	result;
+
+	/* The row a BEFORE-row override is applied to (the op's new row). */
+	if (is_row)
+	{
+		if (TRIGGER_FIRED_BY_INSERT(td->tg_event))
+			newtup = td->tg_trigtuple;
+		else if (TRIGGER_FIRED_BY_UPDATE(td->tg_event))
+			newtup = td->tg_newtuple;
+	}
+
+	ip = ensure_interp(trusted);
+	pure_switch_interp(ip);
+	cf = compile_function(lang, ip, fcinfo->flinfo->fn_oid, true);
+
+	if ((rc = SPI_connect()) != SPI_OK_CONNECT)
+		elog(ERROR, "SPI_connect failed: %s", SPI_result_code_string(rc));
+	SPI_register_trigger_data(td);
+	spi_call_begin();
+	set_stack_limit();
+	pending_pg_error = NULL;
+
+	/*
+	 * Publish this trigger's data for the pg_pure_trig_* externs, which the
+	 * wrapper calls (inside the evaluation frame below) to build new/old/tg.
+	 * The closure takes () as its single argument. Restore current_trigdata
+	 * even if an extern raises a PG error that longjmps out of the call.
+	 */
+	current_trigdata = td;
+	args[0] = pure_tuplel(0);
+	PG_TRY();
+	{
+		res = pure_appxv(cf->fun, 1, args, &exc);
+	}
+	PG_FINALLY();
+	{
+		current_trigdata = saved_td;
+	}
+	PG_END_TRY();
+	if (!res)
+	{
+		spi_call_end();
+		SPI_finish();
+		report_pure_failure(lang, "uncaught exception", exc);
+	}
+
+	/*
+	 * AFTER and statement triggers ignore the return value. Return a NULL
+	 * tuple pointer (not an SQL NULL): the executor reads the Datum as a
+	 * HeapTuple*, and isnull must stay false or it raises "returned null
+	 * value". A NULL pointer means "proceed with the row unchanged".
+	 */
+	if (!is_row || !is_before)
+	{
+		pure_freenew(res);
+		spi_call_end();
+		SPI_finish();
+		fcinfo->isnull = false;
+		return PointerGetDatum(NULL);
+	}
+
+	/* A BEFORE-row trigger: sql::null means skip the operation (NULL tuple). */
+	ret_isnull = pure_is_symbol(res, &sym) && sym == sym_sql_null;
+	if (ret_isnull)
+	{
+		pure_freenew(res);
+		spi_call_end();
+		SPI_finish();
+		fcinfo->isnull = false;
+		return PointerGetDatum(NULL);
+	}
+
+	/*
+	 * Build the stored row after SPI_finish, in the upper memory context, so
+	 * it outlives SPI's context. The override is applied to the row the op
+	 * started with (the new row for INSERT/UPDATE). pure_record_to_tuple
+	 * errors cleanly if the body returned neither a record nor sql::null.
+	 */
+	spi_call_end();
+	SPI_finish();
+	result = pure_record_to_tuple(res, tupdesc, newtup);
+	pure_freenew(res);
+	fcinfo->isnull = false;
+	return PointerGetDatum(result);
+}
+
 static Datum
 call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 {
@@ -1916,14 +2340,13 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	int			rc;
 
 	if (CALLED_AS_TRIGGER(fcinfo))
-		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-						errmsg("%s does not support triggers yet", lang)));
+		return call_trigger(lang, trusted, fcinfo);
 	if (CALLED_AS_EVENT_TRIGGER(fcinfo))
 		ereport(ERROR, (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 						errmsg("%s does not support event triggers yet", lang)));
 	ip = ensure_interp(trusted);
 	pure_switch_interp(ip);
-	cf = compile_function(lang, ip, fcinfo->flinfo->fn_oid);
+	cf = compile_function(lang, ip, fcinfo->flinfo->fn_oid, false);
 
 	/* Convert arguments outside of any Pure call: they may ereport. */
 	for (int i = 0; i < cf->nargs; i++)
@@ -1990,14 +2413,21 @@ static void
 validate_function(const char *lang, bool trusted, Oid fn_oid, FunctionCallInfo fcinfo)
 {
 	pure_interp *ip;
+	HeapTuple	tup;
+	bool		istrigger;
 
 	if (!CheckFunctionValidatorAccess(fcinfo->flinfo->fn_oid, fn_oid))
 		return;
 	if (!check_function_bodies)
 		return;
+	tup = SearchSysCache1(PROCOID, ObjectIdGetDatum(fn_oid));
+	if (!HeapTupleIsValid(tup))
+		elog(ERROR, "cache lookup failed for function %u", fn_oid);
+	istrigger = ((Form_pg_proc) GETSTRUCT(tup))->prorettype == TRIGGEROID;
+	ReleaseSysCache(tup);
 	ip = ensure_interp(trusted);
 	pure_switch_interp(ip);
-	(void) compile_function(lang, ip, fn_oid);
+	(void) compile_function(lang, ip, fn_oid, istrigger);
 }
 
 Datum
