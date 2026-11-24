@@ -1,0 +1,52 @@
+name: Docs
+
+# Build the HTML reference from doc/pg_pure.sgml and publish to GitHub Pages on
+# push to main.  GitHub Pages must be enabled for the repo with source =
+# "GitHub Actions" (Settings -> Pages) so deploy-pages has a target.
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'doc/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment; let an in-progress run finish.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install DocBook toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends xsltproc docbook-xsl-ns docbook-xml
+
+      - name: Render doc/pg_pure.sgml -> doc/html/
+        run: |
+          export DOCBOOK_XSL=/usr/share/xml/docbook/stylesheet/docbook-xsl-ns/html/docbook.xsl
+          doc/build-html.sh
+
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: doc/html
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

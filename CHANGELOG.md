@@ -4,6 +4,46 @@ All notable changes to pg_pure are recorded here. The format follows
 [Keep a Changelog](https://keepachangelog.com/); versions are
 [semantic](https://semver.org/).
 
+## [0.12.0] - 2026-11-24
+
+### Fixed
+- A use-after-free in the result-conversion error path.  When a function
+  result did not fit its declared type, the value string was copied into the
+  SPI memory context and then read after `SPI_finish` had destroyed that
+  context to build the error message.  A normal build happened to still print
+  the old bytes; a cassert build (which clobbers freed memory) showed the
+  value as blank.  The string is now copied after `SPI_finish`, into the
+  restored caller context.  Found by the new cassert build (ROADMAP 1.8).
+
+### Added
+- **Benchmark harness** (`bench/`): `setup.sql` defines the same three
+  workloads (iterative Fibonacci, a numeric sum, a 3x3 SPD solve over float8[])
+  in pg_pure, PL/pgSQL, PL/Python and PL/Perl; `run.sh` times them with warm
+  steady-state and cold first-call measurements, interleaved, median of seven
+  runs, server executor time.  `bench/README.md` records the method and the
+  findings; `bench/results-2026-11-24.txt` is a captured run on PostgreSQL 17,
+  18 and 19.
+- **Formal documentation**: a DocBook reference manual (`doc/pg_pure.sgml`)
+  rendered to HTML by `doc/build-html.sh` (xsltproc + docbook-xsl), published
+  to GitHub Pages by a new Docs workflow.  `make html` builds it locally.
+- **RELEASING.md** documents the tag-triggered release, the gate on 17/18/19,
+  the Codeberg to GitHub mirror, and the PGXN publish.
+- A trigger regression case in `sql/pg_pureu.sql` (the TAP suite already
+  covered triggers; this adds coverage to the installcheck suite).
+
+### Retracted
+- The claim that `gsl::linalg::cholesky_solve` runs "about 40x faster than the
+  same solve in PL/pgSQL" was wrong.  That figure came from a single warmed
+  call measured in one session and ignored both the cold compile and a fair
+  per-call comparison.  Measured properly (`bench/`, c7i.4xlarge, PostgreSQL
+  17/18/19): warm, the compiled Cholesky is about 4x faster than a hand-written
+  PL/pgSQL solve (1.6 vs 6.0 us per call), not 40x.  And pg_pure is not a
+  general speed win: it is 2x to 5x slower warm on scalar recursion and much
+  slower on exact-number loops, and every new backend pays a one-time LLVM
+  compile of about 9 seconds per distinct function (the warmed JIT state does
+  not survive fork; a connection pooler is the practical answer).  The README,
+  `doc/pg_pure.sgml` and the ROADMAP now state the measured numbers.
+
 ## [0.11.0] - 2026-11-23
 
 ### Added

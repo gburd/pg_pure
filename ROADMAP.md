@@ -18,9 +18,10 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
 - [x] 0.3 A safe mode (commit "Add a safe mode ..."): `pure_is_safe`,
       `pure_safe_allow_using`, `pure_safe_arm`. This is what the trusted
       `pg_pure` uses (phase 3).
-- [ ] 0.2 Keep a crash-matrix reproducer in pg_pure's TAP suite (ROADMAP 1.7)
-      so a future libpure that re-exports LLVM is caught. (Not in the fork;
-      it belongs here.)
+- [x] 0.2 Keep a crash-matrix reproducer in pg_pure's TAP suite (ROADMAP 1.7)
+      so a future libpure that re-exports LLVM is caught -- `t/001_crash_matrix.pl`
+      runs PostgreSQL JIT and Pure in the same backend in both orders and
+      checks the server log; part of `ci/gate.sh` and CI on PG 17/18/19.
 
 ## Phase 1: the extension (pg_pureu now, pg_pure on top)
 
@@ -61,14 +62,26 @@ Both landed in the fork on `libpure-embeddable` (tip `ab12de13`):
       effectively inherited across fork, so preload does not lower first-call
       latency today. A connection pooler, which keeps backends warm, is the
       current answer. Making warm state survive fork is open (likely libpure).
+      Quantified in the 0.12 benchmark: the first call to a function in a
+      backend costs about 9 s of LLVM compile, every call after is fast; this
+      is the single largest factor in pg_pure's real-world cost. Still a
+      libpure/LLVM limitation, not addressable in the extension.
 - [x] 1.7 TAP tests: crash safety (JIT plus Pure in both orders, checked in
       the server log -- `t/001_crash_matrix.pl`, 0-crash on a JIT-enabled
       PG 17/18/19); cancel and `pg_terminate_backend`; 8 concurrent backends;
       RSS over millions of calls plateaus -- `t/002_robustness.pl`. Run by
       `ci/gate.sh` and in CI. (A LATIN1-database case remains for phase 2b.)
-- [ ] 1.8 A cassert build of PostgreSQL from source on the box (and, once
-      Greg's LLVM-21 work lands, a server whose llvmjit matches libpure's
-      LLVM major -- the matched-major no-clash case, DESIGN.md 5a).
+- [x] 1.8 A cassert build of PostgreSQL from source (0.12): a
+      `--enable-cassert --enable-debug` PostgreSQL 18 built from source on the
+      box, with pg_pure built against it and both regression suites run under
+      it via `ci/gate.sh` (it installs to a user prefix without sudo and skips
+      TAP, which a source build does not install).  This found and fixed a
+      use-after-free in the result-conversion error path: the value string was
+      pstrdup'd into the SPI context and read after SPI_finish destroyed it, so
+      on a normal build the message happened to still print but on cassert
+      (CLOBBER_FREED_MEMORY) the value came out blank.  Zero asserts/traps
+      otherwise.  The matched-major no-clash case (llvmjit on libpure's LLVM
+      major, DESIGN.md 5a) is still open, pending the server-side LLVM-21 work.
 
 Gate: `ci/gate.sh` passes installcheck and TAP on PG 17 and PG 18, plus
 the cassert leg; the server log has 0 "terminated by signal" lines and 0
@@ -149,8 +162,15 @@ of them -- the Nix package (2.A), the TAP suite (2.B) and parameterized SPI
       guard a numeric precision bug fixed in 0.6.1. (Written as a TAP test,
       not a hegel C harness: the conversion only runs through a live backend,
       so the oracle is a SQL value round-tripped through a pg_pure function.)
-- [ ] 2.6 Benchmarks against PL/pgSQL, PL/Python and PL/Perl: interleaved
-      runs and medians, method and box recorded under `bench/` with a date.
+- [x] 2.6 Benchmarks against PL/pgSQL, PL/Python and PL/Perl (0.12): the
+      harness is `bench/setup.sql` + `bench/run.sh` (warm steady-state and cold
+      first-call, interleaved, median of 7, server executor time), results and
+      method in `bench/README.md` with the box and date, a captured run on PG
+      17/18/19 in `bench/results-2026-11-24.txt`. Finding: pg_pure pays a large
+      one-time per-function LLVM compile per backend (~9 s), is 2-5x slower
+      warm on scalar recursion and much slower on exact-number loops, and is
+      ~4x faster than a hand-written PL/pgSQL Cholesky only through the
+      compiled gsl routine. The earlier "~40x" claim is retracted (CHANGELOG).
 
 Gate: phase 1 gate, plus the module tests and the property suite.
 
@@ -192,8 +212,16 @@ for untrusted multi-tenant workloads.
 
 ## Phase 4: release
 
-- [ ] 4.1 Docs (SGML and HTML), the PGXN package, Debian packaging, and
-      RELEASING.md in the style of pg_fts's.
+- [x] 4.1 Docs and release machinery (0.12): a DocBook SGML reference
+      (`doc/pg_pure.sgml`) rendered to HTML by `doc/build-html.sh` and
+      published to GitHub Pages by `.github/workflows/docs.yml`, both in the
+      style of pg_fts's; `RELEASING.md` documents the tag-triggered release,
+      the gate, the Codeberg->GitHub mirror and PGXN. The PGXN package and the
+      tag-triggered release workflow were already in place from 1.1. Debian/RPM
+      packaging is intentionally not shipped: pg_pure is a source extension
+      linking an out-of-tree libpure, so a distro package would have to package
+      libpure too; like pg_fts (the decided template) it ships as source. See
+      RELEASING.md "What a release produces".
 
 ## Decided
 

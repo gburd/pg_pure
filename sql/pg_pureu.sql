@@ -242,5 +242,26 @@ CREATE FUNCTION rat_of(x float8) RETURNS text LANGUAGE pg_pureu AS
 $PURE$ using rational; str (rational x) $PURE$;
 SELECT rat_of(0.75);                    -- 3L%4L
 
+-- Triggers. A RETURNS trigger body sees new, old and tg; a BEFORE-row body
+-- returns a record to become the row (overriding only the columns it names)
+-- or sql::null to skip. AFTER and statement triggers ignore the return.
+CREATE TABLE trg_item (id int, qty int, price numeric, total numeric);
+CREATE FUNCTION trg_fill() RETURNS trigger LANGUAGE pg_pureu AS
+$PURE$ insert new ("total" => new!"qty" * new!"price") $PURE$;
+CREATE TRIGGER t_fill BEFORE INSERT OR UPDATE ON trg_item
+  FOR EACH ROW EXECUTE FUNCTION trg_fill();
+INSERT INTO trg_item (id, qty, price) VALUES (1, 3, 5.0), (2, 10, 2.5);
+SELECT id, qty, price, total FROM trg_item ORDER BY id;   -- total filled
+UPDATE trg_item SET qty = 4 WHERE id = 1;
+SELECT id, total FROM trg_item WHERE id = 1;              -- recomputed to 20
+-- returning sql::null from a BEFORE INSERT skips the row
+CREATE FUNCTION trg_reject() RETURNS trigger LANGUAGE pg_pureu AS
+$PURE$ if new!"qty" > 100 then sql::null else new $PURE$;
+CREATE TRIGGER t_reject BEFORE INSERT ON trg_item
+  FOR EACH ROW EXECUTE FUNCTION trg_reject();
+INSERT INTO trg_item (id, qty, price) VALUES (3, 999, 1.0);   -- skipped
+INSERT INTO trg_item (id, qty, price) VALUES (4, 7, 1.0);     -- kept
+SELECT id FROM trg_item ORDER BY id;                     -- 1,2,4 (3 skipped)
+
 -- many calls of a compiled function in one statement
 SELECT sum(pmul(i, 2)) FROM generate_series(1, 100000) i;

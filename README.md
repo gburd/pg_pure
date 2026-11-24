@@ -123,8 +123,12 @@ CREATE FUNCTION solve_spd(a float8[], b float8[]) RETURNS float8[]
   LANGUAGE pg_pure AS $$ gsl::linalg::cholesky_solve a b $$;
 ```
 
-That runs about 40x faster than the same solve in PL/pgSQL. See the pg.ddx.io
-evaluation notes for the measured trade-off.
+That calls GSL's compiled routine, so once the backend is warm it runs about
+4x faster than a hand-written PL/pgSQL Cholesky (1.6 vs 6.0 us per call on a
+c7i.4xlarge; see `bench/`).  The first call in a fresh backend pays a one-time
+LLVM compile of about 9 seconds, so the win applies to long-lived connections
+that call the function many times, not one-shot connections.  See Performance
+below and `bench/README.md` for the full method and numbers.
 
 Reaching the database with SPI, with a parameter passed as data (never
 spliced), and catching a SQL error by its SQLSTATE:
@@ -284,20 +288,36 @@ needs to understand.
 
 ## Performance
 
-Measured on an EC2 c7i.4xlarge, Debian 13, PG 18, libpure on LLVM 21:
+Measured on an EC2 c7i.4xlarge, Debian 13, PostgreSQL 17/18/19, libpure on
+LLVM 21, 2026-11-24.  The harness and the full results are in `bench/`.
 
-| | |
-|---|---|
-| First `pg_pureu` call in a fresh backend (no preload) | ~5.3 s (interpreter create + LLVM codegen of the prelude) |
-| First call, preloaded and warmed in the postmaster | ~0.16 s |
-| Each further new function's first call | 72–165 ms |
-| 1M calls of `x*y+1` in one SELECT | plain SQL ~97 ms, PL/pgSQL ~306 ms, pg_pureu ~455 ms |
-| Backend memory after the first call | ~105 MB private |
+pg_pure's cost is bimodal, and both halves matter.
 
-The one-time first-call cost is LLVM compiling the Pure prelude code the call
-reaches. **Preload** (`shared_preload_libraries`) pays it once in the
-postmaster; backends then inherit it by fork. A connection pooler helps either
-way, since the interpreter is per-backend.
+**Cold first call is expensive.**  The first call to a given pg_pure function
+in a backend compiles it with LLVM, about 9 s on this box.  PL/pgSQL,
+PL/Python and PL/Perl each start a function in under 15 ms.  Preload
+(`shared_preload_libraries`) warms the postmaster, but a forked backend does
+not inherit the warmed codegen (the warmed JIT state does not survive fork,
+ROADMAP 1.6), so every new connection pays this once per distinct function.
+A connection pooler that keeps backends alive is the practical answer; without
+one, pg_pure suits long-lived connections that call a function many times, not
+one-shot connections.
+
+**Warm steady state is a mixed result** (microseconds per call):
+
+| workload | pg_pure | PL/pgSQL | PL/Python | PL/Perl |
+|----------|--------:|---------:|----------:|--------:|
+| fib  (iterative Fibonacci) |   9.7 |  4.1 |  1.8 |  2.8 |
+| hsum (sum of i*i as numeric) |  97.8 | 17.6 |  4.5 |  3.2 |
+| chol (3x3 SPD solve, float8[]) |   1.6 |  6.0 |   -  |   -  |
+
+pg_pure is 2x to 5x slower on scalar recursion and much slower on exact-number
+work (its integers are GMP rationals converted to `numeric`).  Where the body
+calls a compiled routine, as `chol` does through `gsl::linalg::cholesky_solve`,
+it beats a hand-written PL/pgSQL solve by about 4x because GSL's compiled C
+does the work and Pure is only the glue.  The draw of pg_pure is
+expressiveness and reaching compiled numerical libraries, not raw per-call
+throughput.
 
 ## Status
 

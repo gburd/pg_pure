@@ -1,0 +1,982 @@
+<!-- doc/pg_pure.sgml -->
+
+<sect1 id="pgpure" xreflabel="pg_pure">
+ <title>pg_pure - write PostgreSQL functions in Pure</title>
+
+ <indexterm zone="pgpure">
+  <primary>pg_pure</primary>
+ </indexterm>
+
+ <para>
+  <filename>pg_pure</filename> makes
+  <ulink url="https://agraef.github.io/pure-lang/">Pure</ulink> a procedural
+  language in PostgreSQL, the way PL/Perl and PL/Python do for their languages.
+  A function body is Pure code; it runs in a Pure interpreter (libpure)
+  embedded in the backend process, and from there it can reach the database
+  through SPI.
+ </para>
+
+ <para>
+  Pure is a functional language built on term rewriting: equational
+  definitions with pattern matching, exact rational and arbitrary-precision
+  arithmetic, lazy streams, and symbolic computation.  Symbolic rewriting is
+  the distinctive reason to reach for it in SQL; no other in-database language
+  simplifies <literal>x*1 + 0*y</literal> to <literal>x</literal>.
+ </para>
+
+ <para>
+  One shared library (<filename>pg_pure.so</filename>) backs two SQL
+  languages, following the PL/Perl <literal>plperl</literal> /
+  <literal>plperlu</literal> model:
+ </para>
+
+ <informaltable>
+  <tgroup cols="4">
+   <thead>
+    <row>
+     <entry>Extension</entry><entry>Trust</entry>
+     <entry>Who can use it</entry><entry>Status</entry>
+    </row>
+   </thead>
+   <tbody>
+    <row>
+     <entry><literal>pg_pure</literal></entry>
+     <entry>trusted</entry>
+     <entry>any user</entry>
+     <entry>works; runs in a libpure safe-mode interpreter</entry>
+    </row>
+    <row>
+     <entry><literal>pg_pureu</literal></entry>
+     <entry>untrusted</entry>
+     <entry>superuser only</entry>
+     <entry>works</entry>
+    </row>
+   </tbody>
+  </tgroup>
+ </informaltable>
+
+ <para>
+  They are separate extensions over one library, so a DBA can install either
+  without the other:
+<programlisting>
+CREATE EXTENSION pg_pureu;   -- untrusted, superuser only
+CREATE EXTENSION pg_pure;    -- trusted, usable by any user
+</programlisting>
+ </para>
+
+ <caution>
+  <para>
+   This module is under active development.  The trusted language runs user
+   bodies in a libpure safe-mode interpreter whose protection is a denylist
+   (<xref linkend="pgpure-security"/>); until an independent security review
+   and a curated safe-mode prelude land (see <filename>ROADMAP.md</filename>),
+   do not rely on <literal>pg_pure</literal> for untrusted multi-tenant
+   workloads.  The SQL interface may change between versions.
+  </para>
+ </caution>
+
+ <sect2 id="pgpure-overview">
+  <title>Overview</title>
+
+  <para>
+   A Pure program can normally call any C function through an
+   <literal>extern</literal> declaration, so untrusted Pure is as powerful as
+   a C extension; only a superuser may create <literal>pg_pureu</literal>
+   functions.  The trusted <literal>pg_pure</literal> runs each function in a
+   libpure safe-mode interpreter: a body that tries <literal>extern</literal>,
+   inline C, <literal>eval</literal> / <literal>evalcmd</literal>, a native or
+   non-allowlisted <literal>using</literal>, or a dangerous prelude function
+   (<literal>exit</literal>, <literal>malloc</literal>, raw pointers) is
+   refused as an SQL ERROR, and the backend is unharmed.  So an unprivileged
+   user can write <literal>pg_pure</literal> functions safely, the way
+   PL/Perl's <literal>plperl</literal> is safe.
+  </para>
+
+  <para>
+   A function body is a single Pure expression, and the SQL argument names are
+   its variables.  Symbolic rewriting is available in SQL, here reducing an
+   algebraic expression to a normal form.  This example uses the untrusted
+   language because it is written as a superuser example in the project
+   sources; it does not reach the database and would run the same under
+   <literal>pg_pure</literal>:
+<programlisting>
+CREATE EXTENSION pg_pureu;
+
+CREATE FUNCTION simplify(e text) RETURNS text LANGUAGE pg_pureu AS $$
+  str (reduce (val e) with
+         x*1 = x; 1*x = x; 0*x = 0; x*0 = 0; x+0 = x; 0+x = x
+       end)
+$$;
+
+SELECT simplify('x*1 + 0*y + (x+0)');   -- x+x
+</programlisting>
+   Arbitrary-precision arithmetic, because Pure integers promote to bigints:
+<programlisting>
+CREATE FUNCTION factorial(n int) RETURNS numeric LANGUAGE pg_pureu AS $$
+  foldl (*) 1L (1..n)
+$$;
+SELECT factorial(30);   -- 265252859812191058636308480000000
+</programlisting>
+   Exact rationals (the <literal>math</literal> module, loaded by default,
+   gives <literal>%</literal>):
+<programlisting>
+CREATE FUNCTION harmonic(n int) RETURNS numeric LANGUAGE pg_pureu AS $$
+  using math;
+  foldl (+) 0 [1%k | k = 1..n]
+$$;
+SELECT harmonic(10);    -- 7381/2520 as an exact numeric: 2.9289682539...
+</programlisting>
+   Recursion and pattern matching in a local definition:
+<programlisting>
+CREATE FUNCTION fib(n int) RETURNS numeric LANGUAGE pg_pureu AS $$
+  loop n 0L 1L with loop 0 a _ = a; loop k a b = loop (k-1) b (a+b) end
+$$;
+SELECT fib(100);        -- 354224848179261915075
+</programlisting>
+  </para>
+
+  <para>
+   The feature set grew release by release: scalar functions and the
+   <literal>sql</literal> namespace (0.1), the trusted language on libpure
+   safe mode (0.2), <literal>float8[]</literal> matrices (0.3), a compiled
+   Cholesky solve (0.4), parameterized SPI and the TAP suite (0.5),
+   set-returning functions (0.6), <literal>bytea</literal> and domains (0.7),
+   more vetted modules (0.8), a transparent SPI plan cache (0.9),
+   <literal>sql::stream</literal> (0.10), and DML triggers (0.11).  See
+   <filename>CHANGELOG.md</filename> for the per-version detail and
+   <filename>ROADMAP.md</filename> for what is deferred.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-install">
+  <title>Installation</title>
+
+  <para>
+   <filename>pg_pure</filename> needs PostgreSQL 17, 18 or 19 and libpure,
+   built once from a fork of upstream Pure.  libpure is not packaged by the
+   distributions; you build and install it under a prefix, then build
+   <filename>pg_pure</filename> against that prefix.
+  </para>
+
+  <formalpara>
+   <title>Building libpure (once)</title>
+   <para>
+    <filename>pg_pure</filename> embeds libpure from a fork that makes the
+    runtime safe to embed in a host process: it does not call
+    <function>exit()</function>, it returns exceptions to the host, and it
+    offers hooks for query-cancel and the stack limit.  Build and install it
+    from the <literal>libpure-embeddable</literal> branch:
+<programlisting>
+git clone --branch libpure-embeddable https://github.com/gburd/pure-lang.git
+cd pure-lang/pure
+autoreconf -fi
+./configure --prefix=$HOME/pure --with-tool-prefix=$(llvm-config --bindir) --enable-release
+make -j
+make install          # installs libpure.so + headers + the prelude under $HOME/pure
+</programlisting>
+    libpure needs LLVM (20.1 or newer; tested with 21) and GMP, MPFR and
+    readline.  On Debian:
+    <literal>apt install llvm-21-dev clang-21 libgmp-dev libmpfr-dev
+    libreadline-dev</literal>.  The add-on Pure modules
+    (<xref linkend="pgpure-modules"/>) are built and installed alongside
+    libpure by the same process; a Nix package
+    (<filename>nix/flake.nix</filename>) builds libpure and the modules
+    together.
+   </para>
+  </formalpara>
+
+  <formalpara>
+   <title>Building and installing pg_pure</title>
+   <para>
+    <literal>PURE_PREFIX</literal> is the prefix where you installed libpure:
+<programlisting>
+make PG_CONFIG=/path/to/pg_config PURE_PREFIX=$HOME/pure
+sudo make install PG_CONFIG=/path/to/pg_config PURE_PREFIX=$HOME/pure
+</programlisting>
+    The prelude is found through libpure's built-in path; if the server runs
+    with a non-standard install, set <literal>PURELIB</literal> in the
+    server's environment to the directory that holds
+    <filename>prelude.pure</filename>.  Then, in a database:
+<programlisting>
+CREATE EXTENSION pg_pureu;   -- or pg_pure
+</programlisting>
+   </para>
+  </formalpara>
+
+  <formalpara>
+   <title>PostgreSQL JIT coexistence</title>
+   <para>
+    libpure JIT-compiles Pure with LLVM, and so does PostgreSQL's own JIT
+    (<filename>llvmjit</filename>), often a different LLVM major.  The fork's
+    libpure hides its LLVM symbols so the two cannot clash, so nothing special
+    is required: <filename>pg_pure</filename> runs on a normal
+    <literal>jit = on</literal> server.  This is tested with
+    <literal>jit_above_cost = 0</literal>, which forces a JIT-compiled query
+    into the same backend as a Pure function, on PostgreSQL 17, 18 and 19 with
+    zero crashes.  The TAP suite keeps a crash-matrix check so a future
+    libpure that re-exported its LLVM symbols would be caught; see
+    <filename>DESIGN.md</filename> section 5.  If you deploy a libpure that
+    does re-export them, a PostgreSQL built without LLVM (on Debian, with the
+    <literal>postgresql-NN-jit</literal> package uninstalled) cannot clash:
+    no backend loads libLLVM, and <literal>jit = on</literal> becomes a silent
+    no-op.
+   </para>
+  </formalpara>
+
+  <formalpara>
+   <title>Preloading (optional)</title>
+   <para>
+    The interpreter is per backend, and the first call in a fresh backend pays
+    a one-time LLVM codegen cost (<xref linkend="pgpure-performance"/>).
+    Preloading builds and warms the interpreter in the postmaster at startup:
+<programlisting>
+# postgresql.conf
+shared_preload_libraries = 'pg_pure'
+pg_pure.using = 'math'      # modules every interpreter loads; default: math
+</programlisting>
+    This is the only configuration.  <literal>pg_pure.using</literal> lists
+    the modules every interpreter loads at creation; exact numeric needs
+    <literal>math</literal>, which is why it is the default.  A connection
+    pooler, which keeps backends warm, is the way to amortize the first-call
+    cost either way, since the interpreter is per backend.
+   </para>
+  </formalpara>
+ </sect2>
+
+ <sect2 id="pgpure-languages">
+  <title>The two languages and the trust model</title>
+
+  <para>
+   <literal>pg_pureu</literal> is untrusted.  A Pure program can call any C
+   function through an <literal>extern</literal> declaration, run inline C
+   (which invokes clang), <literal>eval</literal> arbitrary Pure, and
+   <literal>using</literal> any file on disk, so untrusted Pure is as powerful
+   as a C extension.  Only a superuser may create <literal>pg_pureu</literal>
+   functions, as with PL/Perl's <literal>plperlu</literal>.
+  </para>
+
+  <para>
+   <literal>pg_pure</literal> is trusted and usable by any user.  It runs each
+   function in a libpure safe-mode interpreter.  The trusted and untrusted
+   languages get separate backend-local interpreters: the untrusted one is
+   created normally, the trusted one is created with libpure's
+   <literal>--safe</literal> mode, has its SPI and notice bridge and the
+   <literal>pg_pure.using</literal> modules set up while still unarmed, and is
+   then armed.  After arming, a body that uses any route out of the language
+   is refused as an SQL ERROR (<xref linkend="pgpure-security"/>).
+  </para>
+
+  <para>
+   A body is compiled as a single parenthesized expression.  A body that tries
+   to close that parenthesis and add a top-level definition is rejected at
+   definition time, so one trusted function cannot leak interpreter state to
+   the next in the same backend.  The two interpreters never collide, because
+   the function cache keys on the interpreter.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-types">
+  <title>Type mapping</title>
+
+  <para>
+   An SQL argument arrives as a Pure value and the function's result is
+   converted back.  Conversions never lose information silently: a value that
+   does not fit its SQL type is an ERROR, not a wrong answer.
+  </para>
+
+  <informaltable>
+   <tgroup cols="3">
+    <thead>
+     <row>
+      <entry>SQL type</entry>
+      <entry>Pure value passed in</entry>
+      <entry>Accepted on return</entry>
+     </row>
+    </thead>
+    <tbody>
+     <row>
+      <entry><type>int2</type>, <type>int4</type></entry>
+      <entry>machine int</entry>
+      <entry>int or bigint; out of range is an ERROR</entry>
+     </row>
+     <row>
+      <entry><type>int8</type></entry>
+      <entry>bigint (<literal>5L</literal>)</entry>
+      <entry>int or bigint; out of range is an ERROR</entry>
+     </row>
+     <row>
+      <entry><type>numeric</type></entry>
+      <entry>bigint if integral, else an exact rational
+       (<literal>x%y</literal>); NaN and Infinity as doubles</entry>
+      <entry>int, bigint, rational, double</entry>
+     </row>
+     <row>
+      <entry><type>float4</type>, <type>float8</type></entry>
+      <entry>double</entry>
+      <entry>double, int, bigint, rational</entry>
+     </row>
+     <row>
+      <entry><type>bool</type></entry>
+      <entry>1 or 0 (Pure's <literal>true</literal> and
+       <literal>false</literal>)</entry>
+      <entry>int; nonzero is true</entry>
+     </row>
+     <row>
+      <entry><type>text</type>, <type>varchar</type>, <type>char</type>,
+       <type>name</type></entry>
+      <entry>string, converted to UTF-8</entry>
+      <entry>strings only</entry>
+     </row>
+     <row>
+      <entry><type>float8[]</type></entry>
+      <entry>a Pure double matrix (1-D &rarr; 1-by-n row vector, 2-D &rarr;
+       n-by-m); no NULL elements, at most 2 dimensions</entry>
+      <entry>a double matrix (1-row &rarr; 1-D, else 2-D)</entry>
+     </row>
+     <row>
+      <entry><type>bytea</type></entry>
+      <entry>a Pure int matrix (1-by-n) of byte values 0..255</entry>
+      <entry>an int matrix; an element outside 0..255 is an ERROR</entry>
+     </row>
+     <row>
+      <entry>a domain</entry>
+      <entry>its base type's Pure value; the CHECK is enforced on the
+       argument</entry>
+      <entry>its base type; the domain CHECK runs on the result</entry>
+     </row>
+     <row>
+      <entry>NULL</entry>
+      <entry><literal>sql::null</literal></entry>
+      <entry><literal>sql::null</literal></entry>
+     </row>
+     <row>
+      <entry>any other type</entry>
+      <entry>its text form, as a string</entry>
+      <entry>a string, passed to the type's input function</entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </informaltable>
+
+  <para>
+   Three rules shape that table, and each surfaces a behavior a SQL author
+   should know:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     <emphasis role="bold">An unmatched application is not an error; it is a
+     normal form.</emphasis>  If your rules do not match the argument, Pure
+     leaves the expression unevaluated (<literal>f 2</literal> stays
+     <literal>f 2</literal>) rather than failing.  <filename>pg_pure</filename>
+     cannot convert that to the return type, so it raises a clear ERROR with a
+     hint to check the argument types your rules expect.  The fix is almost
+     always a catch-all rule (<literal>f _ = ...</literal>) or matching the
+     right type.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <emphasis role="bold">SQL <type>int2</type> / <type>int4</type> are Pure
+     machine integers, and they wrap silently.</emphasis>
+     <literal>2147483647 + 1</literal> is <literal>-2147483648</literal>
+     inside Pure, as the Pure manual documents.  The final result is
+     range-checked when it is converted back (an out-of-range
+     <type>smallint</type> is an error, not a wrong number), but a wrap
+     <emphasis>inside</emphasis> the computation is not caught.  For big
+     intermediate values, work in <type>int8</type> or <type>numeric</type>
+     (Pure bigints) or convert with <literal>bigint x</literal>.  A rule
+     <literal>f 0 = ...</literal> fires for an <type>int4</type> argument but
+     not for an <type>int8</type> one, because an <type>int8</type> arrives as
+     a bigint and <literal>0L</literal> does not match the pattern
+     <literal>0</literal>; compare <type>int8</type> with <literal>==</literal>
+     or convert with <literal>int n</literal> when you know it fits.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <emphasis role="bold">A <type>text</type> result must be a Pure
+     string.</emphasis>  <filename>pg_pure</filename> will not stringify an
+     arbitrary Pure value for you, because that would hide the
+     unmatched-application error above as plausible but wrong text.  Call
+     <literal>str</literal> yourself if you mean to.  A <type>numeric</type> is
+     exact in and out: an integral numeric is a Pure bigint, a fractional one
+     an exact rational (needs <literal>math</literal>, loaded by default), and
+     a non-terminating rational returned as <type>numeric</type> is rounded to
+     the display scale, as any numeric division is.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Numeric arrays map to Pure double matrices in both directions.  A 1-D array
+   is a row vector, a 2-D array an n-by-m matrix:
+<programlisting>
+CREATE FUNCTION vscale(v float8[], k float8) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ map (*k) v $$;
+SELECT vscale(ARRAY[1,2,3]::float8[], 10.0);       -- {10,20,30}
+
+CREATE FUNCTION mtransp(m float8[]) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ using gsl::matrix; transpose m $$;
+SELECT mtransp(ARRAY[[1,2,3],[4,5,6]]::float8[]);  -- {{1,4},{2,5},{3,6}}
+</programlisting>
+   A <type>float8[]</type> with a NULL element, or more than two dimensions,
+   cannot become a dense Pure matrix and is rejected with a clear error.
+  </para>
+
+  <para>
+   <type>bytea</type> maps to a Pure int matrix of byte values, so arbitrary
+   binary, embedded NUL included, round-trips, and a body can read or build
+   the bytes:
+<programlisting>
+CREATE FUNCTION bsum(x bytea) RETURNS int LANGUAGE pg_pureu AS
+  $$ foldl (+) 0 (list x) $$;
+SELECT bsum('\x010203'::bytea);     -- 6
+
+CREATE FUNCTION bmk() RETURNS bytea LANGUAGE pg_pureu AS $$ {65,66,67} $$;
+SELECT bmk();                        -- \x414243
+</programlisting>
+   A matrix element outside 0..255 is an ERROR, not a wrap.
+  </para>
+
+  <para>
+   A domain is accepted as its base type, with the CHECK enforced on the
+   argument by PostgreSQL and on the result by <filename>pg_pure</filename>:
+<programlisting>
+CREATE DOMAIN posint AS int4 CHECK (VALUE > 0);
+CREATE FUNCTION pdomneg(x int4) RETURNS posint LANGUAGE pg_pureu AS
+  $$ x - 100 $$;
+SELECT pdomneg(150);    -- 50
+SELECT pdomneg(1);      -- ERROR: result (1-100) violates posint
+</programlisting>
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-sql-namespace">
+  <title>Database access: the <literal>sql</literal> namespace</title>
+
+  <para>
+   Everything <filename>pg_pure</filename> adds to Pure lives in the
+   <literal>sql</literal> namespace.  A parameterized query or command passes
+   its parameters to the planner as Datums via
+   <function>SPI_execute_with_args</function>; the values are never spliced
+   into the SQL text, so a value full of SQL metacharacters is just data, not
+   an injection.  Each parameter's SQL type is inferred from the Pure value
+   (int &rarr; int8, double &rarr; float8, string &rarr; text, bigint &rarr;
+   numeric, <literal>sql::null</literal> &rarr; a SQL NULL).  Each
+   <literal>sql::query</literal> and <literal>sql::exec</literal> runs in its
+   own internal subtransaction, as in PL/Python: if the statement fails, that
+   subtransaction is rolled back and the SQL error reaches Pure as
+   <literal>sql::error "SQLSTATE" "message"</literal>, which Pure can catch to
+   continue, or let propagate to re-raise the original error intact.
+  </para>
+
+  <variablelist>
+   <varlistentry>
+    <term><function>sql::query q</function>,
+     <function>sql::query (q, [p1, p2, ...])</function>
+     &rarr; list of rows</term>
+    <listitem>
+     <para>
+      Run a query and return its rows as a list.  A row is a tuple of column
+      values, and a one-column row is the bare value.
+<programlisting>
+CREATE FUNCTION pparam(lo int) RETURNS int LANGUAGE pg_pureu AS $$
+  foldl (+) 0 (sql::query ("SELECT k FROM t WHERE k >= $1", [lo]))
+$$;
+SELECT pparam(2);                       -- sum of the rows with k >= 2
+</programlisting>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><function>sql::exec q</function>,
+     <function>sql::exec (q, [p1, ...])</function>
+     &rarr; number of rows processed</term>
+    <listitem>
+     <para>
+      Run a command and return the number of rows processed.  The parameter
+      below carries SQL metacharacters and is still only data; the table
+      survives:
+<programlisting>
+CREATE FUNCTION pupd(nv text, kk int) RETURNS int LANGUAGE pg_pureu AS $$
+  sql::exec ("UPDATE t SET v = $1 WHERE k = $2", [nv, kk])
+$$;
+SELECT pupd('ONE', 1);                  -- 1
+</programlisting>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><function>sql::stream q</function>,
+     <function>sql::stream (q, [p1, ...])</function>
+     &rarr; a lazy list of rows</term>
+    <listitem>
+     <para>
+      The lazy counterpart of <literal>sql::query</literal>: it opens an SPI
+      cursor and returns an ordinary Pure lazy list that fetches the next
+      batch of rows each time the list is forced further, so a body can reduce
+      or <literal>take</literal> from a large result without building the whole
+      list.  Every list operation works, including <literal>foldl</literal>,
+      <literal>take</literal>, a comprehension and a <literal>head:tail</literal>
+      match.
+<programlisting>
+CREATE FUNCTION ssum() RETURNS int LANGUAGE pg_pureu AS $$
+  foldl (+) 0 (sql::stream "SELECT k FROM t")
+$$;
+</programlisting>
+      A stream is valid only within the function call that opened it.  When the
+      call returns, <filename>pg_pure</filename> closes the cursor; a stream
+      value forced after that (one a body tried to hand back) raises a
+      <literal>sql::error</literal>, and the backend survives.  Each force
+      finds the cursor fresh by name and checks a per-call epoch, so there is
+      no stored pointer to dangle.  A holdable cursor that outlives the call is
+      deferred (<filename>ROADMAP.md</filename>).
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><function>sql::notice msg</function>,
+     <function>sql::warning msg</function> &rarr; message to the client</term>
+    <listitem>
+     <para>
+      Send a NOTICE or WARNING to the client:
+<programlisting>
+CREATE FUNCTION psay(m text) RETURNS int LANGUAGE pg_pureu AS $$
+  sql::notice m $$ 0
+$$;
+SELECT psay('hello from pure');
+</programlisting>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><literal>sql::null</literal></term>
+    <listitem>
+     <para>
+      SQL NULL, both as an argument and as a result.  A body matches on it and
+      produces it:
+<programlisting>
+CREATE FUNCTION pnull(x int) RETURNS int LANGUAGE pg_pureu AS $$
+  case x of sql::null = 0; _ = x+1 end
+$$;
+SELECT pnull(NULL), pnull(41);          -- 0, 42
+</programlisting>
+     </para>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry>
+    <term><function>sql::error sqlstate message</function></term>
+    <listitem>
+     <para>
+      The exception an SQL error turns into.  Catch it by SQLSTATE to continue
+      the transaction, or throw it to raise that SQL error:
+<programlisting>
+CREATE FUNCTION add_user(email text) RETURNS bool LANGUAGE pg_pureu AS $$
+  catch dup (sql::exec ("INSERT INTO users(email) VALUES ($1)", [email]) > 0)
+  with dup (sql::error "23505" _) = false; dup e = throw e end
+$$;
+</programlisting>
+      A parameterized query is planned once and its plan reused across calls
+      with the same text and the same inferred parameter types; the cache is
+      transparent, per backend, and bounded, and PostgreSQL revalidates a saved
+      plan on its own when a referenced object, the search path or the current
+      role changes.
+     </para>
+    </listitem>
+   </varlistentry>
+  </variablelist>
+ </sect2>
+
+ <sect2 id="pgpure-srf">
+  <title>Set-returning functions</title>
+
+  <para>
+   A function declared <literal>RETURNS SETOF</literal> of a scalar or
+   <type>float8[]</type> produces one row per element of the Pure list its
+   body yields.  Rows are collected into a tuplestore, and each element is
+   converted with the scalar range checks:
+<programlisting>
+CREATE FUNCTION pupto(n int) RETURNS SETOF int LANGUAGE pg_pureu AS $$
+  1..n
+$$;
+SELECT pupto(5);                 -- 1,2,3,4,5 as five rows
+SELECT sum(x) FROM pupto(10) AS x;   -- 55
+</programlisting>
+   A lazy or infinite stream is walked one cons cell at a time, so a body that
+   bounds the stream itself returns its rows without realizing the rest:
+<programlisting>
+CREATE FUNCTION primes(n int) RETURNS SETOF int LANGUAGE pg_pureu AS $$
+  take n (sieve (2..inf)) with
+    sieve (p:qs) = p : sieve [q | q = qs; q mod p] &amp;
+  end
+$$;
+SELECT * FROM primes(10);        -- 2 3 5 7 11 13 17 19 23 29
+</programlisting>
+  </para>
+
+  <note>
+   <para>
+    A set-returning function materializes all its rows before the executor
+    applies <literal>LIMIT</literal>, so the body must bound the stream itself
+    (<literal>take n ...</literal>).  <literal>SELECT * FROM primes(10)
+    LIMIT 4</literal> still computes ten primes, and an unbounded body is
+    stopped by cancel or a hard row cap, not by <literal>LIMIT</literal>.  A
+    <literal>CHECK_FOR_INTERRUPTS</literal> between rows keeps a long stream
+    cancellable.  <literal>RETURNS TABLE(...)</literal> and
+    <literal>SETOF</literal> of a composite type are not yet supported; see
+    <filename>ROADMAP.md</filename>.
+   </para>
+  </note>
+ </sect2>
+
+ <sect2 id="pgpure-triggers">
+  <title>Triggers</title>
+
+  <para>
+   A <literal>RETURNS trigger</literal> function can back a DML trigger:
+   BEFORE or AFTER, ROW or STATEMENT, on INSERT, UPDATE or DELETE, and
+   TRUNCATE.  The body sees three variables:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     <literal>new</literal> and <literal>old</literal> are row records, or
+     <literal>sql::null</literal> when the event has no such row.  For INSERT,
+     <literal>new</literal> is the row and <literal>old</literal> is
+     <literal>sql::null</literal>; for DELETE, <literal>old</literal> is the
+     row and <literal>new</literal> is <literal>sql::null</literal>; for
+     UPDATE, <literal>new</literal> is the new row and <literal>old</literal>
+     the pre-update row.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <literal>tg</literal> is a record describing the event, with the keys
+     "name", "when", "level", "op", "table_name", "table_schema" and "args".
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   In a BEFORE-row trigger, returning a record makes it the stored row, and
+   returning <literal>sql::null</literal> skips the operation, which is
+   PostgreSQL's own convention.  A returned record overrides only the columns
+   it names; columns it omits keep the row's original value, as PL/Python
+   does, so a body need not echo every column.  PostgreSQL ignores the return
+   value of AFTER and statement-level triggers.
+<programlisting>
+CREATE FUNCTION fill_total() RETURNS trigger LANGUAGE pg_pureu AS $PURE$
+  insert new ("total" => new!"qty" * new!"price")
+$PURE$;
+CREATE TRIGGER t_total BEFORE INSERT OR UPDATE ON line_item
+  FOR EACH ROW EXECUTE FUNCTION fill_total();
+</programlisting>
+   The body above overrides only <literal>total</literal>; the other columns
+   keep the values the statement supplied.  A BEFORE-row body can skip a row by
+   returning <literal>sql::null</literal>:
+<programlisting>
+CREATE FUNCTION trg_reject() RETURNS trigger LANGUAGE pg_pureu AS $PURE$
+  if new!"qty" > 100 then sql::null else new
+$PURE$;
+CREATE TRIGGER t_reject BEFORE INSERT ON trg_item
+  FOR EACH ROW EXECUTE FUNCTION trg_reject();
+</programlisting>
+  </para>
+
+  <note>
+   <para>
+    Event triggers and procedure transaction control
+    (<literal>sql::commit</literal>, <literal>sql::rollback</literal>) are not
+    supported; see <filename>ROADMAP.md</filename>.
+   </para>
+  </note>
+ </sect2>
+
+ <sect2 id="pgpure-do">
+  <title>DO blocks and procedures</title>
+
+  <para>
+   An anonymous code block runs a Pure expression once:
+<programlisting>
+DO LANGUAGE pg_pureu $$
+  sql::exec "UPDATE line_item SET total = qty * price WHERE total IS NULL"
+$$;
+</programlisting>
+   A DO block is compiled as a temporary named function, called once and then
+   cleared, so its compiled code can be freed.
+   <command>CREATE PROCEDURE ... LANGUAGE pg_pureu</command> works with
+   <command>CALL</command>.  Transaction control inside procedures is a later
+   phase (<filename>ROADMAP.md</filename>).
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-modules">
+  <title>Add-on Pure modules</title>
+
+  <para>
+   Pure modules are scripts in the Pure library path, often with a C shared
+   object next to them.  A body loads one with a <literal>using</literal> line
+   at the top (untrusted), or the DBA allow-lists it through
+   <literal>pg_pure.using</literal> (trusted).  Before a module goes on the
+   tested list it is checked for process exits and aborts, signal handlers,
+   threads, writes to standard output, and global error handlers.  The vetted
+   modules, each exercised by an in-database regression test, are:
+  </para>
+
+  <informaltable>
+   <tgroup cols="2">
+    <thead>
+     <row><entry>Module</entry><entry>What it provides</entry></row>
+    </thead>
+    <tbody>
+     <row>
+      <entry><literal>math</literal></entry>
+      <entry>Loaded by default; exact rationals (<literal>%</literal>).</entry>
+     </row>
+     <row>
+      <entry><literal>gsl</literal>, <literal>gsl::linalg</literal></entry>
+      <entry>GSL numeric routines, including a compiled Cholesky solve of a
+       symmetric positive-definite system.  GSL's abort-on-error handler is
+       turned off.</entry>
+     </row>
+     <row>
+      <entry><literal>mpfr</literal></entry>
+      <entry>Arbitrary-precision floats
+       (<literal>mpfr_set_default_prec</literal> then compute).</entry>
+     </row>
+     <row>
+      <entry><literal>dict</literal></entry>
+      <entry>The stldict STL-backed associative maps.</entry>
+     </row>
+     <row>
+      <entry><literal>rational</literal></entry>
+      <entry>Utilities on math's exact rationals, such as a double to a
+       fraction.</entry>
+     </row>
+    </tbody>
+   </tgroup>
+  </informaltable>
+
+  <para>
+   For a dense linear solve, prefer the compiled routine over a hand-written
+   one: a pure-Pure Cholesky is correct but slow, so use
+   <literal>gsl::linalg::cholesky_solve</literal>, which solves a symmetric
+   positive-definite <literal>A x = b</literal> over <type>float8[]</type> at
+   C speed (about 4x faster warm than the same solve in PL/pgSQL; see
+   Performance).  In the trusted
+   language the DBA allow-lists the module once
+   (<literal>pg_pure.using = 'math gsl::linalg'</literal>):
+<programlisting>
+CREATE FUNCTION solve_spd(a float8[], b float8[]) RETURNS float8[]
+  LANGUAGE pg_pure AS $$ gsl::linalg::cholesky_solve a b $$;
+</programlisting>
+   A trusted body may not pull in an arbitrary module with its own
+   <literal>using</literal> clause; that is the DBA's decision.
+   <literal>csv</literal>, <literal>xml</literal> and <literal>stllib</literal>
+   build against the fork but are not yet on the tested list (csv and xml are
+   file and document oriented, awkward in a single-expression body), and
+   <literal>glpk</literal> needs a fork-side fix to its error hook.  Licenses:
+   <literal>gsl</literal> and <literal>glpk</literal> are GPL,
+   <literal>mpfr</literal> and others LGPL or MIT; a module you load is loaded
+   by you at runtime, not shipped with <filename>pg_pure</filename>.  This is
+   not legal advice.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-security">
+  <title>The safe-mode security model</title>
+
+  <para>
+   The trusted <literal>pg_pure</literal> runs each function in a libpure
+   safe-mode interpreter that is armed after its SPI bridge and the
+   <literal>pg_pure.using</literal> modules are in place.  After arming, a
+   function body is refused if it uses any route out of the language:
+  </para>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     an <literal>extern</literal> declaration, inline C (<literal>%&lt; ...
+     %&gt;</literal>, which runs clang), or <literal>eval</literal> /
+     <literal>evalcmd</literal>;
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     a <literal>using</literal> of a native module
+     (<literal>lib:</literal>, <literal>bc:</literal>, <literal>dsp:</literal>)
+     or of any module not on the <literal>pg_pure.using</literal> allowlist;
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     a dangerous prelude function (<literal>exit</literal>,
+     <literal>malloc</literal>, <literal>free</literal>, raw pointer access),
+     which never binds to C in safe mode, so a call to it stays an unevaluated
+     normal form that result conversion rejects, rather than running.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   Each refusal is an SQL ERROR and the backend survives; every route has a
+   regression case in <filename>sql/pg_pure.sql</filename>, verified on
+   PostgreSQL 17, 18 and 19.  A separate guard, independent of libpure, keeps
+   a body from defining a top-level Pure rule: the body is compiled as a single
+   parenthesized expression and is rejected at definition time if it closes a
+   bracket it did not open or leaves one open.  That closes the state-leak
+   channel between trusted functions in one backend; libpure's safe mode blocks
+   the routes out of the language, not top-level definitions, so this guard is
+   what keeps one function's interpreter state private from the next.
+  </para>
+
+  <caution>
+   <para>
+    The safe mode is a denylist: the dangerous externs are refused at
+    declaration.  The stronger end state is a curated safe-mode prelude that
+    never declares them, plus an independent security review, before relying on
+    <literal>pg_pure</literal> for untrusted multi-tenant use.  Both are
+    deferred (<filename>ROADMAP.md</filename>).  Until then the denylist plus
+    arming is what stands between a <literal>pg_pure</literal> function and the
+    host.
+   </para>
+  </caution>
+
+  <para>
+   Other safety properties hold in both languages.  An uncaught Pure
+   <literal>throw</literal> becomes
+   <literal>ERROR: uncaught exception: &lt;value&gt;</literal> (SQLSTATE
+   38000) and the session keeps working.  Runaway recursion becomes the
+   exception <literal>stack_fault</literal> (bounded by
+   <varname>max_stack_depth</varname>), then an SQL error, not a crash.  A
+   <varname>statement_timeout</varname> or <function>pg_terminate_backend</function>
+   cancels a running Pure computation, including an infinite loop, through
+   libpure's interrupt hook.  No PostgreSQL ERROR longjmps through Pure frames,
+   and no Pure exception escapes into PostgreSQL; the boundary rules that
+   guarantee this are in <filename>DESIGN.md</filename> section 4.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-performance">
+  <title>Performance</title>
+
+  <para>
+   Measured on an EC2 c7i.4xlarge, Debian 13, PostgreSQL 17, 18 and 19,
+   libpure on LLVM 21, 2026-11-24.  The harness and full results are under
+   <filename>bench/</filename>.  The cost is bimodal: a large one-time compile
+   per function per backend, then fast warm calls.
+  </para>
+
+  <para>
+   The first call to a given pg_pure function in a backend compiles it with
+   LLVM, about 9 seconds on this box.  PL/pgSQL, PL/Python and PL/Perl each
+   start a function in under 15 ms.  Preloading
+   (<literal>shared_preload_libraries = 'pg_pure'</literal>) warms the
+   postmaster, but a forked backend does not inherit the warmed codegen, so
+   every new connection pays this once per distinct function.  A connection
+   pooler that keeps backends alive is the practical answer.
+  </para>
+
+  <para>
+   Warm steady state, in microseconds per call:
+  </para>
+
+  <informaltable>
+   <tgroup cols="5">
+    <thead>
+     <row><entry>workload</entry><entry>pg_pure</entry><entry>PL/pgSQL</entry><entry>PL/Python</entry><entry>PL/Perl</entry></row>
+    </thead>
+    <tbody>
+     <row><entry>fib (iterative Fibonacci)</entry><entry>9.7</entry><entry>4.1</entry><entry>1.8</entry><entry>2.8</entry></row>
+     <row><entry>hsum (sum of i*i as numeric)</entry><entry>97.8</entry><entry>17.6</entry><entry>4.5</entry><entry>3.2</entry></row>
+     <row><entry>chol (3x3 SPD solve, float8[])</entry><entry>1.6</entry><entry>6.0</entry><entry>-</entry><entry>-</entry></row>
+    </tbody>
+   </tgroup>
+  </informaltable>
+
+  <para>
+   pg_pure is 2x to 5x slower warm on scalar recursion and much slower on
+   exact-number work (its integers are GMP rationals converted to
+   <type>numeric</type>).  Where the body calls a compiled routine, as
+   <literal>chol</literal> does through
+   <function>gsl::linalg::cholesky_solve</function>, it beats a hand-written
+   PL/pgSQL solve by about 4x because GSL's compiled C does the work and Pure
+   is only the glue.  The draw of pg_pure is expressiveness and reaching
+   compiled numerical libraries, not raw per-call throughput.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-limitations">
+  <title>Limitations</title>
+
+  <itemizedlist>
+   <listitem>
+    <para>
+     The trusted language's protection is a denylist armed in a libpure
+     safe-mode interpreter; a curated safe-mode prelude and an independent
+     security review are deferred, so do not rely on
+     <literal>pg_pure</literal> for untrusted multi-tenant workloads yet
+     (<xref linkend="pgpure-security"/>).
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Preloading front-loads the one-time LLVM codegen into postmaster startup
+     but does not lower a forked backend's first-call latency; use a connection
+     pooler (<xref linkend="pgpure-performance"/>).
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     A set-returning function materializes all its rows before
+     <literal>LIMIT</literal> applies; an unbounded body must bound itself
+     (<xref linkend="pgpure-srf"/>).
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     <literal>sql::stream</literal> is scoped to the call that opened it; a
+     holdable cursor that streams to a later statement is deferred.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Not yet supported: <literal>RETURNS TABLE</literal> and
+     <literal>SETOF</literal> of a composite type, composite types as
+     arguments, event triggers, per-SQL-user trusted interpreters, and
+     transaction control in procedures.
+    </para>
+   </listitem>
+   <listitem>
+    <para>
+     Windows is not supported (three independent blockers, in
+     <filename>DESIGN.md</filename> section 10).  Linux (Debian 13) on
+     PostgreSQL 17, 18 and 19, and FreeBSD, are supported.
+    </para>
+   </listitem>
+  </itemizedlist>
+
+  <para>
+   <filename>ROADMAP.md</filename> is the single plan file; it records what is
+   done and what is deferred, and it is the reference for everything the list
+   above defers.
+  </para>
+ </sect2>
+
+ <sect2 id="pgpure-authors">
+  <title>Authors</title>
+
+  <para>
+   Gregory Burd.
+  </para>
+ </sect2>
+
+</sect1>

@@ -7,6 +7,8 @@
 /tmp_check/
 regression.diffs
 regression.out
+/doc/html/
+/bench/pgpure_bench.*/
 
 # regression expected output is TRACKED (a global ~/.config/git/ignore drops
 # *.out; force it back in so a clone has the expected files).

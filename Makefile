@@ -47,6 +47,13 @@ dist:
 	git archive --format=zip --prefix=$(DISTNAME)/ -o $(DISTNAME).zip HEAD
 	@echo "created $(DISTNAME).zip"
 
+# --- HTML reference from the SGML -------------------------------------------
+# Renders doc/pg_pure.sgml to doc/html/ (needs xsltproc + docbook-xsl). The
+# Docs CI workflow runs the same script and publishes to GitHub Pages.
+.PHONY: html
+html:
+	doc/build-html.sh
+
 # --- Pure-ASCII install SQL guard -------------------------------------------
 # A non-ASCII byte in an install/upgrade .sql or a .control makes CREATE
 # EXTENSION fail on a non-UTF-8 server database. Keep the shipped SQL and the C

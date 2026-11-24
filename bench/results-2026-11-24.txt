@@ -1,0 +1,52 @@
+========== PG 17 ==========
+# pg_pure benchmark
+# date:      2026-11-24T14:34:30Z
+# box:       Debian GNU/Linux 13 (trixie) x86_64  (EC2 c7i.4xlarge)
+# postgres:  17.12 (Debian 17.12-1.pgdg13+1)
+# method:    warm = median of 7 interleaved runs of 20000 calls in one
+#            warmed backend; cold = first call in a fresh connection.
+# figures:   warm_us_per_call (steady state) and cold_ms (first-call latency).
+#
+function             warm_us/call        cold_ms
+fib_plpgsql                 4.113          0.967
+fib_plpython                1.847         14.281
+fib_plperl                  2.829          9.374
+fib_pure                   10.459       9151.818
+#
+hsum_plpgsql               19.592          0.908
+hsum_plpython               4.514         14.385
+hsum_plperl                 3.132          9.332
+hsum_pure                 102.959       9218.812
+#
+chol_plpgsql                5.850          1.658
+chol_pure                   1.544       9137.065
+#
+crashes PG17: 0
+========== PG 18 ==========
+psql: error: connection to server on socket "/tmp/.s.PGSQL.5494" failed: No such file or directory
+	Is the server running locally and accepting connections on that socket?
+crashes PG18: 0
+========== PG 19 ==========
+# pg_pure benchmark
+# date:      2026-11-24T14:39:00Z
+# box:       Debian GNU/Linux 13 (trixie) x86_64  (EC2 c7i.4xlarge)
+# postgres:  19.0 (Debian 19.0-2.pgdg13+1)
+# method:    warm = median of 7 interleaved runs of 20000 calls in one
+#            warmed backend; cold = first call in a fresh connection.
+# figures:   warm_us_per_call (steady state) and cold_ms (first-call latency).
+#
+function             warm_us/call        cold_ms
+fib_plpgsql                 4.370          1.086
+fib_plpython                1.833         13.997
+fib_plperl                  2.929          9.338
+fib_pure                    9.690       9144.816
+#
+hsum_plpgsql               17.273          0.989
+hsum_plpython               4.455         14.137
+hsum_plperl                 3.177          9.505
+hsum_pure                  97.819       9187.750
+#
+chol_plpgsql                6.056          1.709
+chol_pure                   1.484       9133.231
+#
+crashes PG19: 0

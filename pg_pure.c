@@ -2377,13 +2377,22 @@ call_function(const char *lang, bool trusted, FunctionCallInfo fcinfo)
 	}
 	if (!pure_to_datum(res, cf->rettype, &d, &isnull, &overflow))
 	{
+		/*
+		 * str() returns a malloc'd C string (libpure's own heap), so it
+		 * survives SPI_finish; capture it, disconnect SPI, then copy it into
+		 * the restored caller context for the message.  pstrdup'ing before
+		 * SPI_finish would allocate in the context SPI_connect made current,
+		 * which SPI_finish destroys -- a use-after-free a cassert build shows
+		 * as a blank value in the error message.
+		 */
 		char	   *s = str(res);
-		char	   *msg = pstrdup(s ? s : "?");
+		char	   *msg;
 
-		free(s);
 		pure_freenew(res);
 		spi_call_end();
 		SPI_finish();
+		msg = pstrdup(s ? s : "?");
+		free(s);
 		if (overflow)
 			ereport(ERROR,
 					(errcode(ERRCODE_NUMERIC_VALUE_OUT_OF_RANGE),
